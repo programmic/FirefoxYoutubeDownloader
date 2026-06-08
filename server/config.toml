@@ -1,0 +1,55 @@
+# Server connection settings used by the Nano extension and local API.
+host = "127.0.0.1"
+port = 8765
+
+# Queue and download concurrency.
+max_concurrent_downloads = 1
+
+# UI / browser behavior.
+close_tab_on_success = false # Not yet used by the current worker.
+
+# Playlist and short-form handling.
+allow_playlists = false # Not yet used by the current worker.
+allow_shorts = false    # Not yet used by the current worker.
+
+# Subtitle and metadata post-processing.
+write_subtitles = true
+embed_subtitles = true
+subtitle_languages = ["en", "de"] # Not yet used by the current worker.
+
+embed_thumbnail = true
+embed_metadata = true
+embed_chapters = true
+
+# Video format and ffmpeg post-processing.
+preferred_video_codecs = ["mp4", "webm", "mkv"]
+preferred_audio_codec = "opus"                  # Not yet used by the current worker.
+remux_video = true
+remux_audio = true                              # Not yet used by the current worker.
+
+recode_video = true
+
+merge_final = true
+
+max_resolution = 1920 # Not yet used by the current worker.
+
+# Authentication / cookies.
+cookies_from_browser = true
+browser_name = "firefox"
+cookies_file = ""           # Optional exported cookies file path. Leave empty to disable.
+
+# SponsorBlock post-processing.
+sponsorblock_enabled = true # Not yet used by the current worker.
+sponsorblock_categories = [ # Not yet used by the current worker.
+  "sponsor",
+  "selfpromo",
+  "interaction",
+  "intro",
+  "outro",
+]
+
+# Download output and local bookkeeping.
+output_template = "E:/downloads/%(title)s.%(ext)s"
+
+archive_file = "archive.txt"   # Not yet used by the current worker.
+database_file = "downloads.db"
