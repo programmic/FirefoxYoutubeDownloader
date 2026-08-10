@@ -52,13 +52,15 @@ class Database:
 
         cursor.execute(
             """
-            INSERT OR REPLACE INTO videos (url, status)
+            INSERT OR IGNORE INTO videos (url, status)
             VALUES (?, ?)
             """,
             (url, status),
         )
 
         self.conn.commit()
+
+        return cursor.rowcount > 0
 
     def update_status(self, url: str, status: str):
 

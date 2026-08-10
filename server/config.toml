@@ -18,20 +18,27 @@ embed_subtitles = true
 subtitle_languages = ["en", "de"] # Not yet used by the current worker.
 
 embed_thumbnail = true
+
 embed_metadata = true
 embed_chapters = true
 
 # Video format and ffmpeg post-processing.
-preferred_video_codecs = ["mp4", "webm", "mkv"]
-preferred_audio_codec = "opus"                  # Not yet used by the current worker.
-remux_video = true
-remux_audio = true                              # Not yet used by the current worker.
+preferred_video_container = ["mp4", "webm", "mkv"]
+preferred_audio_container = "opus"                 # Not yet used by the current worker.
+
+p_vcodec = "avc1"
+p_acodec = "mp4a"
+
+remux_video = false
+remux_audio = false # Not yet used by the current worker.
 
 recode_video = true
+compress = true
 
 merge_final = true
 
-max_resolution = 1920 # Not yet used by the current worker.
+# max resolution: height (1080), yt format (1920p) or resolution (1920x1080)
+max_resolution = "1920x1080" # Not yet used by the current worker.
 
 # Authentication / cookies.
 cookies_from_browser = true
@@ -39,8 +46,8 @@ browser_name = "firefox"
 cookies_file = ""           # Optional exported cookies file path. Leave empty to disable.
 
 # SponsorBlock post-processing.
-sponsorblock_enabled = true # Not yet used by the current worker.
-sponsorblock_categories = [ # Not yet used by the current worker.
+sponsorblock_enabled = true
+sponsorblock_categories = [
   "sponsor",
   "selfpromo",
   "interaction",
@@ -48,8 +55,19 @@ sponsorblock_categories = [ # Not yet used by the current worker.
   "outro",
 ]
 
+# mark video as watched on YouTube
+mark_watched = false # NOT YET IMPLEMENTED
+
 # Download output and local bookkeeping.
 output_template = "E:/downloads/%(title)s.%(ext)s"
 
 archive_file = "archive.txt"   # Not yet used by the current worker.
 database_file = "downloads.db"
+
+js_runtime_loc = ".env/JSRUNTIME"
+ffprobe_loc = ".env/FFMPROBE"
+ffmpeg_loc = ".env/FFMPEG"
+
+# run yt-dlp in verbal mode (useful for debugging etc.)
+ytdlp_verbal = false
+progress = true

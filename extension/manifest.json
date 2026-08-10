@@ -1,8 +1,18 @@
 {
     "manifest_version": 2,
-    "name": "YT Auto Queue",
-    "version": "1.1",
+    "name": "YT Smart Downloader",
+    "version": "1.1.2",
     "description": "Queues YouTube tabs to local downloader",
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "yt-smart-downloader-public@example.com",
+            "data_collection_permissions": {
+                "required": [
+                    "none"
+                ]
+            }
+        }
+    },
     "permissions": [
         "tabs",
         "http://127.0.0.1/*"
@@ -13,7 +23,17 @@
         ]
     },
     "browser_action": {
-        "default_title": "YT Auto Queue",
+        "default_title": "YT Smart Downloader",
+        "default_popup": "popup.html"
+    },
+    "icons": {
+        "32": "icons/icon_32.png",
+        "64": "icons/icon_64.png"
+    },
+    "action": {
+        "default_icon": {
+            "32": "icons/icon-32.png"
+        },
         "default_popup": "popup.html"
     }
 }

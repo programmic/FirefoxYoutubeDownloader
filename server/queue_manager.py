@@ -1,24 +1,30 @@
 import time
 import asyncio
 
-from downloader import download_video
+from .download_worker import download_video
 from .database import Database
+from . import state
 
 # Use a Database instance here (avoid importing app to prevent circular imports)
 db = Database()
 
 HEARTBEAT_INTERVAL = 5
+PRINT_HEARTBEAT = False
 DOWNLOAD_TIMEOUT = 900
 MAX_WORKERS = 2
 
 
 async def heartbeat(queue: asyncio.Queue):
     while True:
-        await asyncio.sleep(HEARTBEAT_INTERVAL)
-        try:
-            print(f"[HEARTBEAT] queue qsize={queue.qsize()}")
-        except Exception as e:
-            print("[HEARTBEAT] failed to read queue size:", e)
+        if state.heartbeat:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            try:
+                if PRINT_HEARTBEAT:
+                    print(f"[HEARTBEAT] queue qsize={queue.qsize()}")
+            except Exception as e:
+                print("[HEARTBEAT] failed to read queue size:", e)
+        else:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
 async def worker(queue: asyncio.Queue):
@@ -32,9 +38,11 @@ async def worker(queue: asyncio.Queue):
 
             url = await queue.get()
             print(f"[WORKER] Dequeued: {url}")
+            print(f"[WORKER] Starting download: ({queue.qsize()} remaining) {url} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
             try:
-                await asyncio.wait_for(download_video(url), timeout=DOWNLOAD_TIMEOUT)
-                db.update_status(url, "completed")
+                result = await asyncio.wait_for(download_video(url), timeout=DOWNLOAD_TIMEOUT)
+                if result and result.get('status') == 'downloaded':
+                    db.update_status(url, "completed")
             except asyncio.TimeoutError:
                 print(f"[WORKER] Timeout downloading: {url}")
                 db.update_status(url, "timeout")

@@ -4,32 +4,72 @@
 <head>
     <meta charset="utf-8">
     <style>
-        body {
-            width: 250px;
-            font-family: sans-serif;
-            padding: 10px;
+        :root {
+            --bg: #050608;
+            --panel: #0b1220;
+            --muted: #9fbfe6;
+            --accent: #0ea5ff;
+            --accent-2: #0066ff;
+            --text: #e6f6ff;
         }
 
-        button {
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial;
+        }
+
+        .container {
+            width: 300px;
+            padding: 14px;
+            box-sizing: border-box;
+        }
+
+        h1 {
+            font-size: 16px;
+            margin: 0 0 10px 0;
+        }
+
+        .btn {
+            display: block;
             width: 100%;
-            margin-bottom: 8px;
-            padding: 8px;
+            padding: 10px 12px;
+            margin-bottom: 10px;
+            border-radius: 8px;
+            border: 0;
+            background: linear-gradient(90deg, var(--accent), var(--accent-2));
+            color: white;
+            font-weight: 600;
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.6);
+            cursor: pointer;
+        }
+
+        .btn:active {
+            transform: translateY(1px);
         }
 
         #status {
-            margin-top: 10px;
-            color: green;
+            margin-top: 8px;
+            color: var(--muted);
+            font-size: 13px
         }
     </style>
 </head>
 
 <body>
 
-    <button id="all">Download All</button>
-    <button id="current">Download Current</button>
-    <button id="specific">Download Specific</button>
-
-    <div id="status">Ready</div>
+    <div class="container">
+        <h1>YT Auto Queue</h1>
+        <button id="all" class="btn">Download All</button>
+        <button id="current" class="btn">Download Current</button>
+        <button id="specific" class="btn">Download Specific</button>
+        <button id="settings" class="btn"
+            style="background:transparent; color:var(--muted); border:1px solid rgba(255,255,255,0.04);">Settings</button>
+        <div id="status">Ready</div>
+    </div>
 
     <script src="popup.js"></script>
 

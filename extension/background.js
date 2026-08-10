@@ -1,17 +1,23 @@
-const SERVER_URL = "http://127.0.0.1:8765/enqueue";
+const SERVER = (typeof browser !== 'undefined' && browser.runtime && browser.runtime.getURL)
+    ? 'http://127.0.0.1:8765'
+    : 'http://127.0.0.1:8765';
 
-const SERVER = "http://127.0.0.1:8765";
+const SERVER_URL = `${SERVER}/enqueue`;
 
 async function send(endpoint, data) {
-    const res = await fetch(`${SERVER}/${endpoint}`, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify(data)
-    });
-
-    return res.ok;
+    try {
+        const res = await fetch(`${SERVER}/${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),
+        });
+        let json = null;
+        try { json = await res.json(); } catch (e) { /* ignore */ }
+        return { ok: res.ok, status: res.status, json };
+    } catch (err) {
+        console.error('Network error to server:', err);
+        return { ok: false, error: String(err) };
+    }
 }
 
 async function getYoutubeTabs() {
@@ -23,27 +29,20 @@ async function getYoutubeTabs() {
 }
 
 async function downloadCurrent() {
-    const tabs = await getYoutubeTabs();
+    // prefer the active tab in the current window (the tab where the popup was opened)
+    const activeTabs = await browser.tabs.query({ active: true, currentWindow: true });
+    const tab = activeTabs[0];
 
-    const tab = tabs[0];
-
-    if (!tab?.url?.includes("youtube.com/watch")) {
+    if (!tab || !tab.url || !tab.url.includes("youtube.com/watch")) {
         return {
             message: "Current tab is not a YouTube video"
         };
     }
 
-    await send("enqueue", {
-        url: tab.url
-    });
-
-    await send("command", {
-        cmd: "!RUNALL"
-    });
-
-    return {
-        message: "Current video queued"
-    };
+    const res = await send('enqueue', { url: tab.url });
+    if (!res.ok) return { message: 'Failed to enqueue: ' + (res.error || res.status) };
+    await send('command', { cmd: '!RUNALL' });
+    return { message: 'Current video queued' };
 }
 
 async function downloadAll() {
@@ -55,8 +54,8 @@ async function downloadAll() {
         if (!tab.url?.includes("youtube.com/watch"))
             continue;
 
-        if (await send("enqueue", { url: tab.url }))
-            count++;
+        const res = await send('enqueue', { url: tab.url });
+        if (res.ok) count++;
     }
 
     await send("command", {
@@ -73,13 +72,10 @@ async function downloadAll() {
 async function enqueueTab(tab) {
     try {
         const res = await fetch(SERVER_URL, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({ url: tab.url })
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: tab.url }),
         });
-
         return res.ok;
     } catch (err) {
         console.error("Failed to enqueue tab:", tab.url, err);
@@ -89,12 +85,7 @@ async function enqueueTab(tab) {
 
 async function enqueueAllTabs() {
     console.log("BUTTON CLICKED");
-
-    await fetch("http://127.0.0.1:8765/log", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: "BUTTON CLICKED" })
-    });
+    await fetch(`${SERVER}/log`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'BUTTON CLICKED' }) });
 
     const tabs = await browser.tabs.query({});
     console.log("TABS FOUND:", tabs.length);
@@ -105,33 +96,13 @@ async function enqueueAllTabs() {
         if (!tab.url) continue;
         if (!tab.url.includes("youtube.com/watch")) continue;
 
-        const res = await fetch("http://127.0.0.1:8765/enqueue", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({ url: tab.url })
-        });
-
+        const res = await fetch(`${SERVER}/enqueue`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: tab.url }) });
         if (res.ok) count++;
     }
 
 
-    await fetch("http://127.0.0.1:8765/log", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: `All found tabs (${count}) enqueued, starting to download...` })
-    });
-
-    await fetch("http://127.0.0.1:8765/command", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-            cmd: "!RUNALL"
-        })
-    });
+    await fetch(`${SERVER}/log`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: `All found tabs (${count}) enqueued, starting to download...` }) });
+    await fetch(`${SERVER}/command`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd: '!RUNALL' }) });
 }
 
 async function downloadSpecific() {
@@ -160,13 +131,37 @@ async function downloadSpecific() {
     });
 
     // send a distinct command so the server can know to present selection for this signal
-    await fetch(`${SERVER}/command`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cmd: `!SELECT ${signal}` })
-    });
+    await fetch(`${SERVER}/command`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd: `!SELECT ${signal}` }) });
 
     return { count: urls.length, signal };
 }
 
-browser.browserAction.onClicked.addListener(enqueueAllTabs);
+// handle messages from popup
+browser.runtime.onMessage.addListener((message, sender) => {
+    if (!message || !message.action) return Promise.resolve({ error: 'no_action' });
+    switch (message.action) {
+        case 'downloadAll':
+            return downloadAll();
+        case 'downloadCurrent':
+            return downloadCurrent();
+        case 'downloadSpecific':
+            return downloadSpecific();
+        default:
+            return Promise.resolve({ error: 'unknown_action' });
+    }
+});
+
+// keep legacy click behavior: prefer `action.onClicked` (MV3), fall back to `browserAction` (MV2)
+if (browser.action && browser.action.onClicked) {
+    try {
+        browser.action.onClicked.addListener(enqueueAllTabs);
+    } catch (e) {
+        console.warn('Failed to register action.onClicked:', e);
+    }
+} else if (browser.browserAction && browser.browserAction.onClicked) {
+    try {
+        browser.browserAction.onClicked.addListener(enqueueAllTabs);
+    } catch (e) {
+        console.warn('Failed to register browserAction.onClicked:', e);
+    }
+}

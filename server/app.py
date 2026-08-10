@@ -54,16 +54,10 @@ async def enqueue(request: Request):
     print(f"Enqueue request: {url}")
     print("QUEUE OBJECT ID:", id(state.queue))
 
-    existing_status = db.get_status(url)
+    inserted = db.add_video(url, "queued")
 
-    if existing_status in [
-        "queued",
-        "downloading",
-        "completed",
-    ]:
+    if not inserted:
         return {"status": "already_exists"}
-
-    db.add_video(url, "queued")
 
     print("QUEUE SIZE BEFORE:", state.queue.qsize())
     await state.queue.put(url)

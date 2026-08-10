@@ -11,7 +11,9 @@ document.getElementById("all").addEventListener("click", async () => {
         action: "downloadAll"
     });
 
-    setStatus(`Sent ${response.count} videos`);
+    if (!response) return setStatus('No response from background');
+    if (response.error) return setStatus('Error: ' + response.error);
+    setStatus(`Sent ${response.count ?? 0} videos`);
 });
 
 document.getElementById("current").addEventListener("click", async () => {
@@ -19,7 +21,9 @@ document.getElementById("current").addEventListener("click", async () => {
         action: "downloadCurrent"
     });
 
-    setStatus(response.message);
+    if (!response) return setStatus('No response from background');
+    if (response.error) return setStatus('Error: ' + response.error);
+    setStatus(response.message ?? JSON.stringify(response));
 });
 
 document.getElementById("specific").addEventListener("click", async () => {
@@ -27,5 +31,19 @@ document.getElementById("specific").addEventListener("click", async () => {
         action: "downloadSpecific"
     });
 
-    setStatus(response.message);
+    if (!response) return setStatus('No response from background');
+    if (response.error) return setStatus('Error: ' + response.error);
+    setStatus(response.message ?? `Sent ${response.count ?? 0}`);
+});
+
+document.getElementById('settings').addEventListener('click', async () => {
+    setStatus('Opening settings...');
+    try {
+        const res = await fetch('http://127.0.0.1:8765/settings/open', { method: 'POST' });
+        if (!res.ok) return setStatus('Failed to open settings');
+        const j = await res.json();
+        setStatus(j.status ?? 'Settings opened');
+    } catch (e) {
+        setStatus('Error opening settings: ' + e.message);
+    }
 });
