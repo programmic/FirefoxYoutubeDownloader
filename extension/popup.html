@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+
 <html>
 
 <head>
@@ -13,7 +14,6 @@
             --text: #e6f6ff;
         }
 
-        html,
         body {
             margin: 0;
             padding: 0;
@@ -26,6 +26,7 @@
             width: 300px;
             padding: 14px;
             box-sizing: border-box;
+            position: relative;
         }
 
         h1 {
@@ -54,24 +55,45 @@
         #status {
             margin-top: 8px;
             color: var(--muted);
-            font-size: 13px
+            font-size: 13px;
+        }
+
+        #version {
+            position: absolute;
+            right: 8px;
+            bottom: 5px;
+            color: rgba(159, 191, 230, 0.55);
+            font-size: 10px;
+            font-weight: 400;
+            pointer-events: none;
         }
     </style>
+
+
 </head>
 
 <body>
 
+
     <div class="container">
         <h1>YT Auto Queue</h1>
+
         <button id="all" class="btn">Download All</button>
         <button id="current" class="btn">Download Current</button>
         <button id="specific" class="btn">Download Specific</button>
+
         <button id="settings" class="btn"
-            style="background:transparent; color:var(--muted); border:1px solid rgba(255,255,255,0.04);">Settings</button>
+            style="background:transparent; color:var(--muted); border:1px solid rgba(255,255,255,0.04);">
+            Settings
+        </button>
+
         <div id="status">Ready</div>
+
+        <div id="version"></div>
     </div>
 
     <script src="popup.js"></script>
+
 
 </body>
 

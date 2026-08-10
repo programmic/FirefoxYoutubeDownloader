@@ -28,12 +28,29 @@ async function getYoutubeTabs() {
     return tabs;
 }
 
+function isYoutubeVideoUrl(url) {
+    if (!url) return false;
+
+    try {
+        const parsed = new URL(url);
+        const pathname = parsed.pathname || '';
+        const host = parsed.hostname.toLowerCase();
+
+        return (
+            (host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com') &&
+            (pathname === '/watch' || pathname.startsWith('/watch/') || pathname.startsWith('/shorts/') || pathname.startsWith('/live/'))
+        ) || (host === 'youtu.be' && pathname.length > 1);
+    } catch (err) {
+        return false;
+    }
+}
+
 async function downloadCurrent() {
     // prefer the active tab in the current window (the tab where the popup was opened)
     const activeTabs = await browser.tabs.query({ active: true, currentWindow: true });
     const tab = activeTabs[0];
 
-    if (!tab || !tab.url || !tab.url.includes("youtube.com/watch")) {
+    if (!tab || !tab.url || !isYoutubeVideoUrl(tab.url)) {
         return {
             message: "Current tab is not a YouTube video"
         };
@@ -41,7 +58,6 @@ async function downloadCurrent() {
 
     const res = await send('enqueue', { url: tab.url });
     if (!res.ok) return { message: 'Failed to enqueue: ' + (res.error || res.status) };
-    await send('command', { cmd: '!RUNALL' });
     return { message: 'Current video queued' };
 }
 
@@ -51,16 +67,12 @@ async function downloadAll() {
     let count = 0;
 
     for (const tab of tabs) {
-        if (!tab.url?.includes("youtube.com/watch"))
+        if (!isYoutubeVideoUrl(tab.url))
             continue;
 
         const res = await send('enqueue', { url: tab.url });
         if (res.ok) count++;
     }
-
-    await send("command", {
-        cmd: "!RUNALL"
-    });
 
     return {
         count
@@ -94,7 +106,7 @@ async function enqueueAllTabs() {
 
     for (const tab of tabs) {
         if (!tab.url) continue;
-        if (!tab.url.includes("youtube.com/watch")) continue;
+        if (!isYoutubeVideoUrl(tab.url)) continue;
 
         const res = await fetch(`${SERVER}/enqueue`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: tab.url }) });
         if (res.ok) count++;
@@ -102,7 +114,6 @@ async function enqueueAllTabs() {
 
 
     await fetch(`${SERVER}/log`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: `All found tabs (${count}) enqueued, starting to download...` }) });
-    await fetch(`${SERVER}/command`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd: '!RUNALL' }) });
 }
 
 async function downloadSpecific() {

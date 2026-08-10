@@ -65,7 +65,7 @@ archive_file = "archive.txt"   # Not yet used by the current worker.
 database_file = "downloads.db"
 
 js_runtime_loc = ".env/JSRUNTIME"
-ffprobe_loc = ".env/FFMPROBE"
+ffprobe_loc = ".env/FFPROBE"
 ffmpeg_loc = ".env/FFMPEG"
 
 # run yt-dlp in verbal mode (useful for debugging etc.)

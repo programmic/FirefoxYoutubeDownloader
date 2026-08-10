@@ -21,6 +21,40 @@ class CmdRequest(BaseModel):
     cmd: str
 
 
+def _queue_has_url(queue, url: str) -> bool:
+    try:
+        queued_items = getattr(queue, "_queue", None)
+        if queued_items is None:
+            return False
+        return any(item == url for item in queued_items)
+    except Exception:
+        return False
+
+
+async def _enqueue_url(url: str):
+    existing_status = db.get_status(url)
+    if existing_status in ["queued", "downloading", "completed"]:
+        return {"status": "already_exists", "url": url}
+
+    if existing_status in ["failed", "error"]:
+        db.update_status(url, "queued")
+    else:
+        db.add_video(url, "queued")
+
+    queue = getattr(state, "queue", None)
+    if queue is None:
+        state.queue = asyncio.Queue()
+        queue = state.queue
+
+    if not _queue_has_url(queue, url):
+        try:
+            queue.put_nowait(url)
+        except Exception as e:
+            print(f"Failed to put {url} on queue: {e}")
+
+    return {"status": "queued", "url": url}
+
+
 @app.on_event("startup")
 async def startup():
     # initialize queue and bind it to the running event loop so other threads
@@ -58,11 +92,7 @@ async def enqueue(request: Request):
     url = data.get("url")
     if url:
         print(f"Received URL: {url}")
-        existing_status = db.get_status(url)
-        if existing_status in ["queued", "downloading", "completed"]:
-            return {"status": "already_exists", "url": url}
-        db.add_video(url, "queued")
-        return {"status": "queued", "url": url}
+        return await _enqueue_url(url)
 
     # Bulk enqueue for immediate queueing (no selection)
     urls = data.get("urls")
@@ -73,11 +103,9 @@ async def enqueue(request: Request):
         for u in urls:
             if not isinstance(u, str):
                 continue
-            existing_status = db.get_status(u)
-            if existing_status in ["queued", "downloading", "completed"]:
-                continue
-            db.add_video(u, "queued")
-            queued += 1
+            result = await _enqueue_url(u)
+            if result.get("status") == "queued":
+                queued += 1
         return {"status": "bulk_queued", "count": queued}
 
     # Bulk enqueue with signal -> store pending selection
@@ -233,18 +261,8 @@ async def post_select(signal: str, request: Request):
 
     queued = 0
     for u in to_enqueue:
-        existing_status = db.get_status(u)
-        if existing_status in ["queued", "downloading", "completed"]:
-            continue
-        db.add_video(u, "queued")
-        # also push onto the in-memory queue so downloads start immediately
-        try:
-            if getattr(state, 'queue', None) is not None:
-                await state.queue.put(u)
-            queued += 1
-        except Exception as e:
-            print(f"Failed to put {u} on queue: {e}")
-            # still count as queued in DB
+        result = await _enqueue_url(u)
+        if result.get("status") == "queued":
             queued += 1
 
     # remove the pending selection after choosing
