@@ -29,27 +29,47 @@ _EPISODE_PREFIX_PATTERNS = (
 
 _RUNTIME_TITLE_CACHE = {}
 
-def _build_ytdlp_auth_args(config):
+def _build_ytdlp_auth_args(config, silence="quiet"):
     """
     Build the JavaScript runtime and authentication arguments used by
     the yt-dlp CLI. These arguments are shared by title fetching and
     actual downloads so both use the exact same configuration.
+    
+    # Parameters:
+    - config: A dictionary containing the configuration settings.
+    - silence: A string indicating the level of silence for yt-dlp output.
+      - "all" (default): Suppresses all output.
+      - "quiet": Suppresses most output but allows warnings and errors.
+      - "not-js": supresses everything but the JavaScript runtime output (useful for debugging JS runtime issues).
+      - "browser": suppresses everything but the browser-related output (useful for debugging browser issues).
     """
+    
+    def print_debug(msg, level="all"):
+        # determines wether the message should be printed based on the silence level
+        # if level is greater or equal to the silence level, print the message
+        levels = {"all": 5, "quiet": 3, "not-js": 1, "browser": 1}
+        if levels.get(level, 0) >= levels.get(silence, 0):
+            print(msg)
+    
     args = []
 
     # JavaScript runtime
-    js_runtime = config.get("JSRUNTIME") or config.get("JS_RUNTIME")
-
-    print(f"[YT-DLP] Configured JS runtime: {js_runtime!r}")
+    js_runtime = config.get("js_runtime_loc")
+    if isinstance(js_runtime, str) and js_runtime.startswith(".env/"):
+        env_name = js_runtime.removeprefix(".env/")
+        js_runtime = os.environ.get(env_name)
+        print_debug(f"[YT-DLP] JS runtime environment variable {env_name}: {js_runtime!r}", level="not-js")
+    else:
+        print_debug(f"[YT-DLP] JS runtime config: {js_runtime!r}", level="not-js")
 
     if js_runtime and str(js_runtime).lower() != "none":
-        js_runtime_path = Path(js_runtime)
+        js_runtime_path = _resolve_project_path(js_runtime)
 
         if js_runtime_path.is_dir():
             js_runtime_path /= "node.exe"
 
-        print(f"[YT-DLP] Resolved JS runtime: {js_runtime_path}")
-        print(f"[YT-DLP] JS runtime exists: {js_runtime_path.is_file()}")
+        print_debug(f"[YT-DLP] Resolved JS runtime: {js_runtime_path}", level="not-js")
+        print_debug(f"[YT-DLP] JS runtime exists: {js_runtime_path.is_file()}", level="not-js")
 
         if js_runtime_path.is_file():
             args.extend([
@@ -57,18 +77,20 @@ def _build_ytdlp_auth_args(config):
                 f"node:{js_runtime_path}",
             ])
         else:
-            print(
+            print_debug(
                 f"[YT-DLP] WARNING: JavaScript runtime not found: "
-                f"{js_runtime_path}"
+                f"{js_runtime_path}",
+                level="quiet"
             )
 
     # Browser cookies
     if config.get("cookies_from_browser"):
         browser_name = config.get("browser_name", "firefox")
 
-        print(
+        print_debug(
             f"[YT-DLP] Using browser cookies from: "
-            f"{browser_name}"
+            f"{browser_name}",
+            level="browser"
         )
 
         args.extend([
@@ -81,11 +103,20 @@ def _build_ytdlp_auth_args(config):
 
     if cookies_file:
         cookies_path = _resolve_project_path(cookies_file)
+        print_debug(
+            f"[YT-DLP] Resolved cookies file: {cookies_path}",
+            level="browser"
+        )
+        print_debug(
+            f"[YT-DLP] Cookies file exists: {cookies_path.is_file()}",
+            level="browser"
+        )
 
         if cookies_path.is_file():
-            print(
+            print_debug(
                 f"[YT-DLP] Using cookies file: "
-                f"{cookies_path}"
+                f"{cookies_path}",
+                level="browser"
             )
 
             args.extend([
@@ -93,17 +124,27 @@ def _build_ytdlp_auth_args(config):
                 str(cookies_path),
             ])
         else:
-            print(
+            print_debug(
                 f"[YT-DLP] WARNING: Cookies file not found: "
-                f"{cookies_path}"
+                f"{cookies_path}",
+                level="quiet"
             )
 
     return args
+
+def _fetch_video_title(url, conf_args=None): #used in download_worker.py and select.py
+    """Fetches the video title using yt-dlp.
+    Reroutes to `_fetch_video_title_async` to avoid blocking the FastAPI event loop."""
+    return asyncio.run(_fetch_video_title_async(url, conf_args=conf_args))
 
 async def _fetch_video_title_async(url, conf_args=None):
     """Asynchronous title fetching to keep the FastAPI event loop unblocked."""
     if url in _RUNTIME_TITLE_CACHE:
         return _RUNTIME_TITLE_CACHE[url]
+    
+    # check for playlist url
+    if "&list=" in url or "?list=" in url:
+        return await _fetch_playlist_title_async(url, conf_args=conf_args)
         
     cached_title = _load_title_from_databank(url)
     if cached_title:
@@ -113,7 +154,7 @@ async def _fetch_video_title_async(url, conf_args=None):
     config = getattr(config_module, "CONFIG", {})
     try:
         args = ["yt-dlp", url, "--get-title", "--no-download", "--quiet"]
-        if not conf_args:
+        if conf_args is None:
             conf_args = _build_ytdlp_auth_args(config)
         args.extend(conf_args)
 
@@ -122,21 +163,52 @@ async def _fetch_video_title_async(url, conf_args=None):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await proc.communicate()
+        stdout, stderr = await proc.communicate()
         
         if proc.returncode == 0:
             title = stdout.decode("utf-8", errors="replace").strip()
             if title:
                 _RUNTIME_TITLE_CACHE[url] = title
                 return title
+        print(f"[TITLE] yt-dlp failed with exit code {proc.returncode}")
+        error_output = stderr.decode("utf-8", errors="replace").strip()
+        if error_output:
+            print(f"[TITLE] stderr:\n{error_output}")
     except Exception as e:
         print(f"[TITLE] Async fetch failed for {url}: {e}")
     
     return url
 
-def _fetch_video_title(url, conf_args=None):
-    """Simple wrapper for synchronous title fetching."""
-    return asyncio.run(_fetch_video_title_async(url, conf_args=conf_args))
+async def _fetch_playlist_title_async(url, conf_args=None):
+    """Fetches the title of a playlist using yt-dlp efficiently."""
+    if conf_args is None:
+        conf_args = _build_ytdlp_auth_args(getattr(config_module, "CONFIG", {}))
+
+    args = [
+        "yt-dlp",
+        url,
+        "--playlist-items", "0",
+        "--print", "playlist_title",
+        "--quiet"
+    ]
+    args.extend(conf_args)
+
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode == 0:
+        title = stdout.decode("utf-8", errors="replace").strip()
+        return title if title else f"Playlist: ({url})"
+    else:
+        print(f"[TITLE] yt-dlp failed to fetch playlist title with exit code {proc.returncode}")
+        error_output = stderr.decode("utf-8", errors="replace").strip()
+        if error_output:
+            print(f"[TITLE] stderr:\n{error_output}")
+        return url
 
 def _replace_suffix(path, new_suffix):
     return str(Path(path).with_suffix(f'.{new_suffix.lstrip(".")}'))
@@ -175,6 +247,9 @@ def _load_title_from_databank(url):
     databank_path = config_module.NAME_DATABANK_PATH
     if not databank_path.is_file():
         return None
+    # accept full links or youtube video IDs
+    if not url.startswith("https://www.youtube.com/watch?v="):
+        url = f"https://www.youtube.com/watch?v={url}"
     try:
         with open(databank_path, 'r', encoding='utf-8') as f:
             databank = json.load(f)
@@ -258,6 +333,10 @@ async def download_video(url, conf_args=None):
         }
 
     try:
+        if conf_args is None:
+            conf_args = _build_ytdlp_auth_args(
+                getattr(config_module, "CONFIG", {})
+            )
         title = await _fetch_video_title_async(url=url, conf_args=conf_args)
     except Exception as e:
         title = url
@@ -266,10 +345,10 @@ async def download_video(url, conf_args=None):
     print(f"[DOWNLOAD] Starting: {url:<50} - {title[:75]:<75}")
 
     # FIXED: Added the mandatory title argument to prevent structural runtime crashes
-    result = await _download_async(url, database, title)
+    result = await _download_async(url, database, title, auth_args=conf_args)
     return result
 
-async def _download_async(url, database, title, config=None):
+async def _download_async(url, database, title, config=None, auth_args=None):
     if config is None:
         config = getattr(config_module, 'CONFIG', {})
 
@@ -312,44 +391,40 @@ async def _download_async(url, database, title, config=None):
     if config.get("recode_video"): 
         args.extend(["--recode-video", "mp4"])
 
-    browser_name = config.get("browser_name")
-    if config.get("cookies_from_browser") and browser_name:
-        args.extend(["--cookies-from-browser", browser_name])
+    if auth_args is None:
+        auth_args = _build_ytdlp_auth_args(config)
+    args.extend(auth_args)
 
-    if config.get("cookies_file"):
-        cookies_path = _resolve_project_path(config["cookies_file"])
-        if cookies_path.is_file():
-            args.extend(["--cookies", str(cookies_path)])
-
-    js_runtime = config.get("js_runtime_loc")
-    if str(js_runtime).startswith(".env/"):
-        js_runtime = os.environ.get(str(js_runtime).removeprefix(".env/"))
-
-    if js_runtime and str(js_runtime).lower() != "none":
-        js_runtime_path = Path(js_runtime)
-        if js_runtime_path.is_dir():
-            js_runtime_path /= "node.exe"
-        if js_runtime_path.is_file():
-            args.extend(["--js-runtimes", f"node:{js_runtime_path}"])
-            
     ffmpeg_location = config.get("ffmpeg_loc")
     if ffmpeg_location:
         if str(ffmpeg_location).startswith(".env/"):
             ffmpeg_location = os.environ.get(str(ffmpeg_location).removeprefix(".env/"))
-        ffmpeg_path = _resolve_project_path(ffmpeg_location)
-        if ffmpeg_path.exists():
-            args.extend(["--ffmpeg-location", str(ffmpeg_path)])
+        if ffmpeg_location:
+            ffmpeg_path = _resolve_project_path(ffmpeg_location)
+            if ffmpeg_path.exists():
+                args.extend(["--ffmpeg-location", str(ffmpeg_path)])
 
     if config.get("sponsorblock_enabled"):
-        cats = config.get("sponsorblock_categories", [])
-        if isinstance(cats, list) and cats:
-            args.extend(["--sponsorblock-remove", ",".join(cats)])
+        sb_categories = config.get("sponsorblock_categories", [])
+        if isinstance(sb_categories, list) and sb_categories:
+            args.extend(["--sponsorblock-remove", ",".join(sb_categories)])
+        else:
+            print("[DOWNLOAD] SponsorBlock is enabled but no categories are specified. Setting to remove all (Default).")
+            args.extend(["--sponsorblock-remove", "all"])
+        
+        # sponsor block force keyframe option to stop timestamp shifting to next I-frame when removing segments
+        if config.get("sb_force_keyframe_at_cut"):
+            args.append("--force-keyframes-at-cuts")
+            
 
     if config.get("merge_final"):
         args.extend(["--merge-output-format", config["preferred_video_container"][0]])
 
     print("\n========== YT-DLP ==========")
     print(*args)
+    print("============================")
+    print(f"[DOWNLOAD] Downloading: {url} - {title[:75]}")
+    print(f"\033[37m[SYSTEM] Queue length: {len(database.get_queued())}\033[0m")
     print("============================\n")
 
     proc = await asyncio.create_subprocess_exec(

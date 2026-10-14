@@ -38,7 +38,7 @@ async def worker(queue: asyncio.Queue):
 
             url = await queue.get()
             print(f"[WORKER] Dequeued: {url}")
-            print(f"[WORKER] Starting download: ({queue.qsize()} remaining) {url} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"[WORKER] Starting download: (\033[37m{queue.qsize()} remaining)\033[0m {url} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
             try:
                 result = await asyncio.wait_for(download_video(url), timeout=DOWNLOAD_TIMEOUT)
                 if result and result.get('status') == 'downloaded':
@@ -47,12 +47,12 @@ async def worker(queue: asyncio.Queue):
                 print(f"[WORKER] Timeout downloading: {url}")
                 db.update_status(url, "timeout")
             except Exception as e:
-                print(f"[WORKER] Error downloading {url}:", e)
+                print(f"\033[31m[WORKER] Error downloading {url}:\033[91m", e, "\033[0m")
                 try:
                     db.update_status(url, "error")
                 except Exception:
                     # ensure worker loop doesn't crash when DB update fails
-                    print("[WORKER] Failed to write error status to DB")
+                    print(f"\033[31m[WORKER] Failed to write error status to DB\033[0m")
             finally:
                 queue.task_done()
 
