@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -219,6 +220,31 @@ def _resolve_project_path(value):
         return path
     return PROJECT_ROOT / path
 
+def _expected_output_path(title, config):
+    """Render the configured output template for the final video filename."""
+    template = config.get("output_template")
+    if not isinstance(template, str):
+        return None
+
+    extension = None
+    if config.get("recode_video"):
+        extension = "mp4"
+    elif config.get("remux_video") or config.get("merge_final"):
+        containers = config.get("preferred_video_container")
+        if isinstance(containers, list) and containers:
+            extension = str(containers[0])
+
+    if extension is None:
+        return None
+
+    try:
+        output_name = template.replace("%(title)s", str(title)).replace(
+            "%(ext)s", extension
+        )
+    except Exception:
+        return None
+    return Path(output_name)
+
 def _format_bytes(value):
     units = ['B', 'KB', 'MB', 'GB', 'TB']
     size = float(value)
@@ -321,6 +347,152 @@ def _build_format_selector(config):
         f"b[height<={max_height}]"
     )
 
+# ---------------------------------------------------------------------------
+# Precise SponsorBlock cutting
+#
+# yt-dlp's own --sponsorblock-remove cuts with `-c copy` + the concat demuxer.
+# Video can only be cut on keyframes, audio on any packet, and every segment
+# boundary adds a small audio/video length mismatch (plus AAC priming delay),
+# so the desync grows after each removed segment. Instead we let yt-dlp only
+# *mark* sponsor segments as chapters, then cut them ourselves in one ffmpeg
+# pass that re-encodes and trims video and audio with the same timestamps.
+# ---------------------------------------------------------------------------
+
+_SB_CHAPTER_PREFIX = "[SponsorBlock]"
+
+# extension -> (video args, audio args, extra args)
+_CUT_CODECS = {
+    ".mp4":  (["-c:v", "libx264", "-preset", "slow", "-crf", "24"], ["-c:a", "aac", "-b:a", "160k"], ["-movflags", "+faststart"]),
+    ".m4v":  (["-c:v", "libx264", "-preset", "slow", "-crf", "24"], ["-c:a", "aac", "-b:a", "160k"], ["-movflags", "+faststart"]),
+    ".mkv":  (["-c:v", "libx264", "-preset", "slow", "-crf", "24"], ["-c:a", "aac", "-b:a", "160k"], []),
+    ".webm": (["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0", "-row-mt", "1"], ["-c:a", "libopus", "-b:a", "128k"], []),
+}
+
+
+def _resolve_ffmpeg_tools(ffmpeg_location):
+    """Return (ffmpeg, ffprobe) executables; falls back to PATH."""
+    ffmpeg, ffprobe = "ffmpeg", "ffprobe"
+    if ffmpeg_location:
+        loc = Path(ffmpeg_location)
+        exe = ".exe" if os.name == "nt" else ""
+        if loc.is_dir():
+            ffmpeg = str(loc / f"ffmpeg{exe}")
+            ffprobe = str(loc / f"ffprobe{exe}")
+        elif loc.is_file():
+            ffmpeg = str(loc)
+            ffprobe = str(loc.with_name(f"ffprobe{loc.suffix}"))
+    return ffmpeg, ffprobe
+
+
+async def _probe_json(ffprobe, path, *flags):
+    proc = await asyncio.create_subprocess_exec(
+        ffprobe, "-v", "error", *flags, "-of", "json", str(path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    return json.loads(stdout.decode("utf-8", errors="replace") or "{}")
+
+
+def _merge_ranges(ranges):
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1] + 0.001:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+async def _cut_sponsors_precisely(path, ffmpeg_location=None):
+    """Remove SponsorBlock-marked chapters from `path` with a frame-accurate re-encode."""
+    path = Path(path)
+    ffmpeg, ffprobe = _resolve_ffmpeg_tools(ffmpeg_location)
+
+    chapters = (await _probe_json(ffprobe, path, "-show_chapters")).get("chapters", [])
+    cuts = _merge_ranges(
+        (float(c["start_time"]), float(c["end_time"]))
+        for c in chapters
+        if (c.get("tags") or {}).get("title", "").startswith(_SB_CHAPTER_PREFIX)
+    )
+    if not cuts:
+        print(f"[SPONSORBLOCK] No sponsor segments in {path.name}; leaving file untouched.")
+        return
+
+    duration = float((await _probe_json(ffprobe, path, "-show_format"))["format"]["duration"])
+
+    # Locate the main video stream and the embedded thumbnail (mp4: attached_pic video stream)
+    streams = (await _probe_json(ffprobe, path, "-show_streams")).get("streams", [])
+    thumb_idx, video_idx = None, None
+    
+    for st in streams:
+        if st.get("codec_type") != "video":
+            continue
+        if (st.get("disposition") or {}).get("attached_pic"):
+            thumb_idx = thumb_idx if thumb_idx is not None else st["index"]
+        elif video_idx is None:
+            video_idx = st["index"]
+    if video_idx is None:
+        print(f"[SPONSORBLOCK] No video stream found in {path.name}; skipping cut.")
+        return
+
+    # Invert the cut list into the ranges we keep
+    keep, cursor = [], 0.0
+    for start, end in cuts:
+        if start - cursor > 0.05:
+            keep.append((cursor, start))
+        cursor = max(cursor, end)
+    if duration - cursor > 0.05:
+        keep.append((cursor, duration))
+    if not keep:
+        print(f"[SPONSORBLOCK] Whole video is marked as removable; skipping cut for {path.name}.")
+        return
+
+    parts, labels = [], []
+    for i, (a, b) in enumerate(keep):
+        parts.append(f"[0:{video_idx}]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[v{i}]")
+        parts.append(f"[0:a:0]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS[a{i}]")
+        labels.append(f"[v{i}][a{i}]")
+    parts.append(f"{''.join(labels)}concat=n={len(keep)}:v=1:a=1[v][a]")
+
+    vargs, aargs, extra = _CUT_CODECS.get(path.suffix.lower(), _CUT_CODECS[".mp4"])
+    out_path = path.with_name(f"{path.stem}.sbcut{path.suffix}")
+
+    # Carry the thumbnail over untouched
+    thumb_args = []
+    if thumb_idx is not None:
+        thumb_args = ["-map", f"0:{thumb_idx}", "-c:v:1", "copy", "-disposition:v:1", "attached_pic"]
+    elif path.suffix.lower() == ".mkv":
+        thumb_args = ["-map", "0:t?", "-c:t", "copy"]  # mkv stores covers as attachments
+
+    # The filter script goes through a file so long segment lists can't hit the command-line limit
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
+        fh.write(";\n".join(parts))
+        script_path = fh.name
+
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
+        "-filter_complex_script", script_path,
+        "-map", "[v]", "-map", "[a]",
+        *vargs, *aargs, *extra,
+        *thumb_args,
+        "-map_chapters", "-1",
+        str(out_path),
+    ]
+    print(f"[SPONSORBLOCK] Cutting {len(cuts)} segment(s) out of {path.name} (re-encoding)...")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        stdout, _ = await proc.communicate()
+    finally:
+        os.unlink(script_path)
+
+    if proc.returncode != 0:
+        out_path.unlink(missing_ok=True)
+        raise RuntimeError(f"ffmpeg sponsor cut failed: {stdout.decode(errors='ignore')[-500:]}")
+
+    os.replace(out_path, path)
+
 async def download_video(url, conf_args=None):
     database = db.Database()
     existing_status = database.get_status(url)
@@ -344,7 +516,16 @@ async def download_video(url, conf_args=None):
         
     print(f"[DOWNLOAD] Starting: {url:<50} - {title[:75]:<75}")
 
-    # FIXED: Added the mandatory title argument to prevent structural runtime crashes
+    output_path = _expected_output_path(title, getattr(config_module, "CONFIG", {}))
+    if output_path is not None and output_path.is_file():
+        print(f"[DOWNLOAD] Skipping existing file: {output_path}")
+        database.update_status(url, "downloaded")
+        return {
+            'status': 'skipped',
+            'reason': 'file_exists',
+            'saved_bytes': 0,
+        }
+
     result = await _download_async(url, database, title, auth_args=conf_args)
     return result
 
@@ -396,26 +577,38 @@ async def _download_async(url, database, title, config=None, auth_args=None):
     args.extend(auth_args)
 
     ffmpeg_location = config.get("ffmpeg_loc")
+    ffmpeg_resolved = None
     if ffmpeg_location:
         if str(ffmpeg_location).startswith(".env/"):
             ffmpeg_location = os.environ.get(str(ffmpeg_location).removeprefix(".env/"))
         if ffmpeg_location:
             ffmpeg_path = _resolve_project_path(ffmpeg_location)
             if ffmpeg_path.exists():
+                ffmpeg_resolved = ffmpeg_path
                 args.extend(["--ffmpeg-location", str(ffmpeg_path)])
 
+    sb_precise_cut = False
+    output_paths_file = None
     if config.get("sponsorblock_enabled"):
         sb_categories = config.get("sponsorblock_categories", [])
         if isinstance(sb_categories, list) and sb_categories:
-            args.extend(["--sponsorblock-remove", ",".join(sb_categories)])
+            sb_arg = ",".join(sb_categories)
         else:
             print("[DOWNLOAD] SponsorBlock is enabled but no categories are specified. Setting to remove all (Default).")
-            args.extend(["--sponsorblock-remove", "all"])
-        
-        # sponsor block force keyframe option to stop timestamp shifting to next I-frame when removing segments
-        if config.get("sb_force_keyframe_at_cut"):
-            args.append("--force-keyframes-at-cuts")
-            
+            sb_arg = "all"
+
+        if config.get("sb_precise_cut", True):
+            # Mark only; we cut afterwards with a re-encode so A/V stays in sync
+            sb_precise_cut = True
+            args.extend(["--sponsorblock-mark", sb_arg, "--embed-chapters"])
+            fd, output_paths_file = tempfile.mkstemp(suffix=".txt")
+            os.close(fd)
+            args.extend(["--no-simulate", "--print-to-file", "after_move:filepath", output_paths_file])
+        else:
+            args.extend(["--sponsorblock-remove", sb_arg])
+            # force keyframe option to stop timestamp shifting to next I-frame when removing segments
+            if config.get("sb_force_keyframe_at_cut"):
+                args.append("--force-keyframes-at-cuts")
 
     if config.get("merge_final"):
         args.extend(["--merge-output-format", config["preferred_video_container"][0]])
@@ -454,6 +647,15 @@ async def _download_async(url, database, title, config=None, auth_args=None):
     rc = await proc.wait()
     if rc != 0:
         raise RuntimeError(f"yt-dlp exit {rc}")
+
+    if sb_precise_cut:
+        try:
+            with open(output_paths_file, encoding="utf-8") as fh:
+                downloaded_files = [ln.strip() for ln in fh if ln.strip()]
+        finally:
+            os.unlink(output_paths_file)
+        for downloaded in downloaded_files:
+            await _cut_sponsors_precisely(downloaded, ffmpeg_resolved)
 
     print(f"\n[DOWNLOAD] Finished downloading: {url}")
     database.update_status(url, "downloaded")

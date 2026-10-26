@@ -45,6 +45,35 @@ class TestAppNano(unittest.TestCase):
                 self.assertEqual(args, ['--js-runtimes', f'node:{runtime}'])
 
 class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
+    async def test_download_skips_when_final_output_file_exists(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = pathlib.Path(tmp_dir) / 'Example.mp4'
+            output_path.touch()
+
+            class FakeDatabase:
+                def get_status(self, url):
+                    return None
+
+                def update_status(self, url, status):
+                    pass
+
+            with patch('server.download_worker.db.Database', return_value=FakeDatabase()), \
+                    patch('server.download_worker._fetch_video_title_async', return_value='Example'), \
+                    patch('server.download_worker._download_async', new=AsyncMock()) as download:
+                with patch.dict(
+                    download_worker.config_module.CONFIG,
+                    {
+                        'output_template': str(pathlib.Path(tmp_dir) / '%(title)s.%(ext)s'),
+                        'recode_video': True,
+                    },
+                    clear=False,
+                ):
+                    result = await download_worker.download_video('https://example.invalid')
+
+            self.assertEqual(result['status'], 'skipped')
+            self.assertEqual(result['reason'], 'file_exists')
+            download.assert_not_awaited()
+
     async def test_download_skips_unset_ffmpeg_env_path(self):
         class FakeStream:
             async def readline(self):
@@ -89,6 +118,20 @@ class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertNotIn('--ffmpeg-location', captured.get('args', []))
+
+
+class TestShutdownOnIdle(unittest.TestCase):
+    def test_shutdown_option_requires_positive_minutes(self):
+        import app_nano
+
+        with self.assertRaises(SystemExit):
+            app_nano._parse_args(['--shutdown_on_idle', '0'])
+
+    def test_shutdown_option_is_parsed(self):
+        import app_nano
+
+        args = app_nano._parse_args(['--shutdown_on_idle', '15'])
+        self.assertEqual(args.shutdown_on_idle, 15)
 
 
 if __name__ == '__main__':

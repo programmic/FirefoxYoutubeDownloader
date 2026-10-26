@@ -12,10 +12,15 @@ import sys
 import subprocess
 import tempfile
 import json
+import argparse
+import ctypes
+import time
 from pathlib import Path
 
 app = FastAPI()
 db = Database()
+shutdown_on_idle_minutes = None
+shutdown_monitor_task = None
 
 class CmdRequest(BaseModel):
     cmd: str
@@ -57,6 +62,7 @@ async def _enqueue_url(url: str):
 
 @app.on_event("startup")
 async def startup():
+    global shutdown_monitor_task
     # initialize queue and bind it to the running event loop so other threads
     # (e.g. the tkinter selection GUI) can schedule work onto it safely.
     if state.queue is None:
@@ -70,7 +76,81 @@ async def startup():
     except Exception as e:
         print("Failed to start queue worker:", e)
 
+    if shutdown_on_idle_minutes is not None:
+        shutdown_monitor_task = asyncio.create_task(_shutdown_when_idle())
+
     print("[SYSTEM] Listening on Port 8765")
+
+
+def _system_idle_seconds():
+    if sys.platform != "win32":
+        return 0.0
+
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+    info = LASTINPUTINFO()
+    info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+        raise OSError("GetLastInputInfo failed")
+    tick_count = ctypes.windll.kernel32.GetTickCount()
+    return max(0.0, (tick_count - info.dwTime) / 1000.0)
+
+
+async def _shutdown_when_idle():
+    idle_seconds = shutdown_on_idle_minutes * 60
+    empty_since = None
+    while True:
+        await asyncio.sleep(5)
+        if state.queue is None or state.queue.qsize() != 0 or state.active_downloads:
+            empty_since = None
+            continue
+
+        now = time.monotonic()
+        if empty_since is None:
+            empty_since = now
+        if now - empty_since < idle_seconds:
+            continue
+        try:
+            device_idle = _system_idle_seconds()
+        except OSError as exc:
+            print(f"[SYSTEM] Unable to determine device idle time: {exc}")
+            return
+        if device_idle < idle_seconds:
+            continue
+
+        print("[SYSTEM] Queue and device idle; shutting down the computer.")
+        subprocess.run(["shutdown", "/s", "/t", "0"], check=False)
+        return
+
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--shutdown_on_idle",
+        type=float,
+        metavar="MINUTES",
+        help="ask for confirmation, then shut down when the device and download queue are idle",
+    )
+    args = parser.parse_args(argv)
+    if args.shutdown_on_idle is not None and args.shutdown_on_idle <= 0:
+        parser.error("--shutdown_on_idle must be greater than zero")
+    return args
+
+
+def _configure_shutdown_on_idle(argv=None):
+    global shutdown_on_idle_minutes
+    args = _parse_args(argv)
+    if args.shutdown_on_idle is None:
+        return
+    answer = input(
+        f"Shut down this PC after {args.shutdown_on_idle:g} minutes of device and queue idle time? [y/N] "
+    ).strip().lower()
+    if answer in {"y", "yes"}:
+        shutdown_on_idle_minutes = args.shutdown_on_idle
+        print("[SYSTEM] Shutdown-on-idle enabled.")
+    else:
+        print("[SYSTEM] Shutdown-on-idle disabled.")
 
 
 @app.post("/enqueue")
@@ -281,6 +361,8 @@ async def debug_db():
 
 
 if __name__ == "__main__":
-    print("Execute the following command from the project root:")
-    print("uvicorn app_nano:app --host 127.0.0.1 --port 8765")
-    print("NOTICE: IF FFMPEG IS NOT ON PATH, PROJECT IN CURRENT STATE WILL FAIL, PROPPER FFMPEG / FFMPROBE SETTINGS ARE IN WORK")
+    _configure_shutdown_on_idle()
+    print("Starting the downloader server.")
+    print("Use: python app_nano.py [--shutdown_on_idle MINUTES]")
+    import uvicorn
+    uvicorn.run(app, host=CONFIG["host"], port=CONFIG["port"])

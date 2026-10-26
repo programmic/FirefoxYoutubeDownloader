@@ -13,3 +13,6 @@ loop = None
 
 # Heartbeat flag to pause heartbeat during certain tasks (e.g. fetching video titles in the selector) to reduce noise in logs.
 heartbeat = True
+
+# Number of downloads currently being processed by queue workers.
+active_downloads = 0
