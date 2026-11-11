@@ -18,14 +18,20 @@ from server import download_worker
 
 class TestAppNano(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(app_nano.app)
+        self.client = TestClient(app_nano.app, headers={'host': '127.0.0.1'})
 
     def test_enqueuing_single_url_works(self):
-        response = self.client.post('/enqueue', json={'url': 'https://youtube.com'})
+        response = self.client.post(
+            '/enqueue',
+            json={'url': 'https://www.youtube.com/watch?v=dyKgT7EOpKU'},
+        )
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertIn(payload['status'], {'queued', 'already_exists'})
-        self.assertEqual(payload['url'], 'https://youtube.com')
+        self.assertEqual(
+            payload['url'],
+            'https://www.youtube.com/watch?v=dyKgT7EOpKU',
+        )
 
     def test_command_unknown_command_is_rejected(self):
         response = self.client.post('/command', json={'cmd': 'not-a-command'})
@@ -45,14 +51,106 @@ class TestAppNano(unittest.TestCase):
                 self.assertEqual(args, ['--js-runtimes', f'node:{runtime}'])
 
 class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
-    async def test_download_skips_when_final_output_file_exists(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            output_path = pathlib.Path(tmp_dir) / 'Example.mp4'
-            output_path.touch()
+    def test_format_selector_prefers_original_audio_track(self):
+        selector = download_worker._build_format_selector({
+            'max_resolution': 1080,
+            'p_vcodec': 'avc1',
+            'p_acodec': 'mp4a',
+        })
 
+        self.assertIn('[language_preference>=10]', selector)
+        self.assertIn('ba[language_preference>=10]', selector)
+        self.assertIn('[dynamic_range=?SDR]', selector)
+
+    def test_format_selector_falls_back_to_available_audio(self):
+        selector = download_worker._build_format_selector({
+            'max_resolution': 1080,
+            'p_vcodec': 'avc1',
+            'p_acodec': 'mp4a',
+        })
+
+        self.assertIn('+ba', selector)
+        self.assertIn('b[height<=1080][dynamic_range=?SDR]', selector)
+        self.assertNotIn('b[height<=1080]+', selector)
+
+    def test_final_encode_defaults_to_available_h264_encoder(self):
+        video_args, pixel_format = download_worker._video_codec_args({})
+
+        self.assertIn('libx264', video_args)
+        self.assertEqual(pixel_format, 'yuv420p')
+
+    def test_final_encode_allows_explicit_av1(self):
+        video_args, pixel_format = download_worker._video_codec_args({'video_codec': 'av1'})
+
+        self.assertIn('libsvtav1', video_args)
+        self.assertEqual(pixel_format, 'yuv420p10le')
+
+    def test_source_frame_rate_rejects_invalid_encoder_rate(self):
+        self.assertEqual(
+            download_worker._source_frame_rate({'r_frame_rate': '30/1'}),
+            '30',
+        )
+        self.assertIsNone(
+            download_worker._source_frame_rate({'r_frame_rate': '1000/1'}),
+        )
+
+    def test_filter_graph_normalizes_video_frame_rate(self):
+        graph = download_worker._build_filter_graph(
+            [(0.0, 3.0)],
+            0,
+            'yuv420p10le',
+            frame_rate='30',
+        )
+
+        self.assertIn('[vc]fps=30,format=yuv420p10le[v]', graph)
+
+    def test_oversized_encode_gets_one_higher_crf_retry(self):
+        self.assertEqual(
+            download_worker._higher_crf({'video_crf': 30}),
+            34,
+        )
+        self.assertEqual(
+            download_worker._higher_crf({'video_crf': 50}),
+            51,
+        )
+        self.assertIsNone(
+            download_worker._higher_crf({'video_crf': 51}),
+        )
+
+    def test_ffmpeg_progress_accepts_numeric_timestamps(self):
+        self.assertAlmostEqual(
+            download_worker._progress_elapsed(
+                {'out_time_us': '1500000'},
+                10.0,
+            ),
+            1.5,
+        )
+        self.assertAlmostEqual(
+            download_worker._progress_elapsed(
+                {'out_time_ms': '2500000'},
+                10.0,
+            ),
+            2.5,
+        )
+        self.assertAlmostEqual(
+            download_worker._progress_elapsed(
+                {'out_time': '00:00:03.250000'},
+                10.0,
+            ),
+            3.25,
+        )
+
+    async def test_download_delegates_after_database_claim(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
             class FakeDatabase:
                 def get_status(self, url):
                     return None
+
+                def is_done(self, url):
+                    return False
+
+                def claim(self, url):
+                    return True
 
                 def update_status(self, url, status):
                     pass
@@ -68,56 +166,81 @@ class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
                     },
                     clear=False,
                 ):
-                    result = await download_worker.download_video('https://example.invalid')
+                    download.return_value = {
+                        'status': 'downloaded',
+                        'saved_bytes': 0,
+                    }
+                    result = await download_worker.download_video(
+                        'https://www.youtube.com/watch?v=dyKgT7EOpKU'
+                    )
 
-            self.assertEqual(result['status'], 'skipped')
-            self.assertEqual(result['reason'], 'file_exists')
-            download.assert_not_awaited()
+            self.assertEqual(result['status'], 'downloaded')
+            download.assert_awaited_once()
 
-    async def test_download_skips_unset_ffmpeg_env_path(self):
-        class FakeStream:
-            async def readline(self):
-                return b''
-
-        class FakeProcess:
-            stdout = FakeStream()
-
-            async def wait(self):
-                return 0
-
+    async def test_download_retries_when_database_says_downloaded_but_file_is_missing(self):
         class FakeDatabase:
-            def get_queued(self):
-                return []
+            def get_status(self, url):
+                return 'downloaded'
+
+            def is_done(self, url):
+                return False
+
+            def claim(self, url):
+                return True
 
             def update_status(self, url, status):
                 pass
 
-        captured = {}
+        with patch('server.download_worker.db.Database', return_value=FakeDatabase()), \
+                patch('server.download_worker._fetch_video_title_async', return_value='Missing'), \
+                patch('server.download_worker._download_async', new=AsyncMock()) as download:
+            with patch.dict(
+                download_worker.config_module.CONFIG,
+                {
+                    'output_template': 'missing-downloads/%(title)s.%(ext)s',
+                    'recode_video': True,
+                },
+                clear=False,
+            ):
+                await download_worker.download_video(
+                    'https://www.youtube.com/watch?v=dyKgT7EOpKU'
+                )
 
-        async def fake_create_subprocess(*args, **kwargs):
-            captured['args'] = args
-            return FakeProcess()
+        download.assert_awaited_once()
 
-        # FFMPEG-Variable entfernen und subprocess_exec patchen
+    async def test_download_skips_unset_ffmpeg_env_path(self):
+        config = {
+            'output_template': 'downloads/%(title)s.%(ext)s',
+            'ffmpeg_loc': '.env/FFMPEG',
+            'preferred_video_container': ['mp4'],
+            'p_vcodec': 'avc1',
+            'p_acodec': 'mp4a',
+            'write_subtitles': True,
+            'subtitle_languages': ['en', 'de'],
+        }
         with patch.dict(os.environ, {}):
             if 'FFMPEG' in os.environ:
                 del os.environ['FFMPEG']
 
-            with patch('server.download_worker.asyncio.create_subprocess_exec', new=fake_create_subprocess):
-                await download_worker._download_async(
-                    'https://example.invalid',
-                    FakeDatabase(),
-                    'Example',
-                    config={
-                        'output_template': 'downloads/%(title)s.%(ext)s',
-                        'ffmpeg_loc': '.env/FFMPEG',
-                        'preferred_video_container': ['mp4'],
-                        'p_vcodec': 'avc1',
-                        'p_acodec': 'mp4a',
-                    },
-                )
+            args = download_worker._build_download_args(
+                'https://www.youtube.com/watch?v=dyKgT7EOpKU',
+                'Example',
+                config,
+                [],
+                None,
+                pathlib.Path('downloads/%(title)s.%(ext)s'),
+                'paths.txt',
+            )
 
-        self.assertNotIn('--ffmpeg-location', captured.get('args', []))
+        self.assertNotIn('--ffmpeg-location', args)
+        self.assertIn('--no-playlist', args)
+        self.assertIn('--windows-filenames', args)
+        self.assertIn('--force-overwrites', args)
+        self.assertIn('--file-access-retries', args)
+        self.assertIn('--write-subs', args)
+        self.assertIn('--sub-langs', args)
+        self.assertIn('en,de', args)
+        self.assertNotIn('--write-auto-subs', args)
 
 
 class TestShutdownOnIdle(unittest.TestCase):

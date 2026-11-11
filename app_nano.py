@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -16,15 +17,28 @@ import argparse
 import ctypes
 import time
 from pathlib import Path
+import signal
+import sys
 
-app = FastAPI()
+import os
+import hmac
+import uuid
+from server.config import CONFIG, API_TOKEN
+
 db = Database()
 shutdown_on_idle_minutes = None
 shutdown_monitor_task = None
+worker_task = None
 
 class CmdRequest(BaseModel):
     cmd: str
 
+def _shutdown_handler(signum, frame):
+    print("\n[SHUTDOWN] Received signal, cleaning up...")
+    if shutdown_monitor_task or worker_task:
+        # Cancel gracefully
+        pass
+    sys.exit(0)
 
 def _queue_has_url(queue, url: str) -> bool:
     try:
@@ -37,19 +51,29 @@ def _queue_has_url(queue, url: str) -> bool:
 
 
 async def _enqueue_url(url: str):
-    existing_status = db.get_status(url)
-    if existing_status in ["queued", "downloading", "completed"]:
-        return {"status": "already_exists", "url": url}
-
-    if existing_status in ["failed", "error"]:
-        db.update_status(url, "queued")
-    else:
-        db.add_video(url, "queued")
+    # validates + normalises (watch?v=X&list=... -> watch?v=X); rejects anything that isn't a YouTube video (S2)
+    clean_url = server.download_worker._normalize_url(url) if isinstance(url, str) else None
+    if clean_url is None:
+        print(f"[ENQUEUE] Rejected URL: {url!r}")
+        return {"status": "rejected", "url": url}
+    url = clean_url
 
     queue = getattr(state, "queue", None)
     if queue is None:
         state.queue = asyncio.Queue()
         queue = state.queue
+
+    existing_status = db.get_status(url)
+    if existing_status == "downloading" or db.is_done(url):
+        return {"status": "already_exists", "url": url}
+    if existing_status == "queued" and _queue_has_url(queue, url):
+        return {"status": "already_exists", "url": url}
+
+    if existing_status is None:
+        db.add_video(url, "queued")
+    else:
+        # failed / interrupted / output file deleted -> allow a retry (H2)
+        db.update_status(url, "queued")
 
     if not _queue_has_url(queue, url):
         try:
@@ -60,9 +84,9 @@ async def _enqueue_url(url: str):
     return {"status": "queued", "url": url}
 
 
-@app.on_event("startup")
-async def startup():
-    global shutdown_monitor_task
+@asynccontextmanager
+async def lifespan(app):
+    global shutdown_monitor_task, worker_task
     # initialize queue and bind it to the running event loop so other threads
     # (e.g. the tkinter selection GUI) can schedule work onto it safely.
     if state.queue is None:
@@ -70,17 +94,60 @@ async def startup():
     # store running loop for thread-safe scheduling
     state.loop = asyncio.get_running_loop()
 
+    # The queue lives in memory, the DB doesn't: rebuild it after a restart/crash (H2)
+    interrupted = db.reset_interrupted()
+    restored = db.get_queued()
+    for restored_url in restored:
+        state.queue.put_nowait(restored_url)
+    if restored:
+        print(f"[SYSTEM]  Restored {len(restored)} queued video(s) from the database ({interrupted} were interrupted).")
+
     # start the background queue worker (will run indefinitely)
     try:
-        asyncio.create_task(queue_manager.worker(state.queue))
+        worker_task = asyncio.create_task(queue_manager.worker(state.queue))
     except Exception as e:
         print("Failed to start queue worker:", e)
 
     if shutdown_on_idle_minutes is not None:
         shutdown_monitor_task = asyncio.create_task(_shutdown_when_idle())
 
-    print("[SYSTEM] Listening on Port 8765")
+    print(f"[SYSTEM]  Listening on Port {CONFIG.get('port')}")
+    try:
+        yield
+    finally:
+        for task in (shutdown_monitor_task, worker_task):
+            if task is not None:
+                task.cancel()
+        tasks = [task for task in (shutdown_monitor_task, worker_task) if task is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
+
+app = FastAPI(lifespan=lifespan)
+
+_ALLOWED_ORIGIN_PREFIXES = ("moz-extension://", "chrome-extension://")
+
+@app.middleware("http")
+async def local_access_guard(request: Request, call_next):
+    """Any website you visit can still *send* requests to 127.0.0.1, so check who is asking.
+    - Host check blocks DNS-rebinding.
+    - Origin check blocks other websites (browsers always send Origin on cross-site POSTs);
+      curl/urllib/the local GUIs send none and pass.
+    - Optional shared secret (API_TOKEN in .env)."""
+    allowed_hosts = {"127.0.0.1", "localhost", str(CONFIG.get("host", "127.0.0.1"))}
+    if request.url.hostname not in allowed_hosts:
+        return JSONResponse(status_code=403, content={"detail": "Bad Host header"})
+
+    origin = request.headers.get("origin")
+    if origin and not origin.startswith(_ALLOWED_ORIGIN_PREFIXES) and origin not in CONFIG.get("allowed_origins", []):
+        return JSONResponse(status_code=403, content={"detail": "Origin not allowed"})
+
+    if API_TOKEN:
+        supplied = request.headers.get("x-api-token", "")
+        if not hmac.compare_digest(supplied.encode(), API_TOKEN.encode()):
+            return JSONResponse(status_code=401, content={"detail": "Missing or wrong token"})
+
+    return await call_next(request)
 
 def _system_idle_seconds():
     if sys.platform != "win32":
@@ -194,7 +261,7 @@ async def enqueue(request: Request):
             return JSONResponse(status_code=422, content={"detail": "'urls' must be a list"})
         # store pending selection in memory
         state.pending_selections[signal] = urls
-        print(f"Stored selection signal {signal} with {len(urls)} urls")
+        # print(f"Stored selection signal {signal} with {len(urls)} urls")
         return {"status": "selection_received", "signal": signal, "count": len(urls), "select_url": f"/select/{signal}"}
 
     return JSONResponse(
@@ -211,7 +278,10 @@ async def log(msg: dict):
 
 @app.post("/command")
 async def command(request: Request):
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=422, content={"detail": "Invalid JSON"})
     cmd = data.get("cmd")
     if not isinstance(cmd, str):
         return JSONResponse(status_code=422, content={"detail": "Missing 'cmd' string"})
@@ -236,17 +306,17 @@ async def command(request: Request):
             # thread issues inside the server process. We write a small JSON file
             # containing the signal and urls and invoke the CLI runner module.
             try:
-                tmp = tempfile.NamedTemporaryFile(prefix=f"select_{signal}_", suffix=".json", delete=False)
+                # The signal comes from the client and must never end up in a file name (S4): use a random one
+                tmp = tempfile.NamedTemporaryFile(prefix=f"select_{uuid.uuid4().hex}_", suffix=".json", delete=False)
                 tmp.write(json.dumps({"signal": signal, "urls": urls}).encode('utf-8'))
                 tmp.flush()
                 tmp.close()
 
                 project_root = Path(__file__).resolve().parent
-                cmd = [sys.executable, '-m', 'server.select_cli', tmp.name]
-                subprocess.Popen(cmd, cwd=str(project_root))
-                print(f"Selection runner started for {signal}; temp file: {tmp.name}")
+                select_cmd = [sys.executable, '-m', 'server.select_cli', tmp.name]
+                subprocess.Popen(select_cmd, cwd=str(project_root))
             except Exception as e:
-                print(f"Failed to start selection runner for {signal}:", e)
+                print(f"[ERROR]   Failed to start selection runner for {signal!r}:", e)
 
             return {"status": "selection_ready", "signal": signal, "select_url": select_url}
         else:
@@ -362,6 +432,8 @@ async def debug_db():
 
 if __name__ == "__main__":
     _configure_shutdown_on_idle()
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    signal.signal(signal.SIGTERM, _shutdown_handler)
     print("Starting the downloader server.")
     print("Use: python app_nano.py [--shutdown_on_idle MINUTES]")
     import uvicorn

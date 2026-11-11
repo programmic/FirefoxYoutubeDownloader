@@ -128,5 +128,5 @@ def load_urls_from_databank(databank_path: pathlib.Path = pathlib.Path(__file__)
 # ==================== USAGE EXAMPLES ====================
 if __name__ == "__main__":
     databank_path = pathlib.Path(__file__).parent / "downloads.db"
-    video_batch = load_urls_from_databank()
+    video_batch = ["g1DRZ0bzF2g"]
     enqueue_multiple_with_selection(video_batch)

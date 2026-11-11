@@ -25,7 +25,7 @@ async def startup():
     # ensure the queue is created on the running event loop
     if state.queue is None:
         state.queue = asyncio.Queue()
-    print("[SYSTEM] Listening on Port 8765")
+    print(f"[SYSTEM]  Listening on Port {CONFIG.get("port")}")
 
 
 @app.post("/enqueue")

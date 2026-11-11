@@ -1,48 +1,57 @@
-# Server connection settings used by the Nano extension and local API.
+# Server connection.
 host = "127.0.0.1"
 port = 8765
+show_config_on_startup = true
 
-# Queue and download concurrency.
+# Queue and download behavior.
+download_timeout = 0 # Seconds per video; 0 = no limit (H1).
 max_concurrent_downloads = 1
+mark_watched = false # Not yet implemented.
+progress = true
+ytdlp_verbal = false # Enable verbose yt-dlp output for debugging.
 
-# UI / browser behavior.
-close_tab_on_success = false # Not yet used by the current worker.
+# Authentication and cookies.
+browser_name = "firefox"
+cookies_file = "" # Optional exported cookies file path. Leave empty to disable.
+cookies_from_browser = true
+
+# Video and audio format selection.
+max_resolution = "1920x1080" # Height (1080), yt format (1920p), or resolution (1920x1080).
+p_acodec = "mp4a"
+p_vcodec = "avc1"
+preferred_audio_container = "opus" # Not yet used by the current worker.
+preferred_video_container = ["mp4", "webm", "mkv"]
+
+# Final encode: one ffmpeg pass performs the SponsorBlock cut, loudnorm,
+# and compression.
+audio_bitrate = "96k" # Opus.
+avoid_size_increase = true # Retry once at a higher CRF when encoding expands the source.
+compress = true
+ffmpeg_threads = 1 # Bound decoder/filter memory for long AV1 sources.
+merge_final = true
+normalize_audio = -16 # LUFS (-30..-5). Remove the key to disable.
+recode_video = false # yt-dlp must not re-encode; the final pass does that.
+remux_video = false
+video_codec = "av1" # "av1" | "hevc" | "h264".
+video_crf = 30 # AV1 ~30-34, HEVC ~24-28, H.264 ~21-24; lower = bigger/better.
+video_preset = 4 # SVT-AV1: 0-13; x265/x264: "slow", "slower", ...
+
+# Download output and bookkeeping.
+# Max 150 bytes of title so Windows paths stay valid (H11).
+output_template = "E:/downloads/%(title).150B.%(ext)s"
+archive_file = "archive.txt" # Not yet used by the current worker.
+database_file = "downloads.db"
 
 # Subtitle and metadata post-processing.
-write_subtitles = true
-embed_subtitles = true
-subtitle_languages = ["en", "de"] # Not yet used by the current worker.
-
-embed_thumbnail = true
-
-embed_metadata = true
 embed_chapters = true
-
-# Video format and ffmpeg post-processing.
-preferred_video_container = ["mp4", "webm", "mkv"]
-preferred_audio_container = "opus"                 # Not yet used by the current worker.
-
-p_vcodec = "avc1"
-p_acodec = "mp4a"
-
-remux_video = false
-remux_audio = false # Not yet used by the current worker.
-
-recode_video = true
-compress = true
-
-merge_final = true
-
-# max resolution: height (1080), yt format (1920p) or resolution (1920x1080)
-max_resolution = "1920x1080"
-
-# Authentication / cookies.
-cookies_from_browser = true
-browser_name = "firefox"
-cookies_file = ""           # Optional exported cookies file path. Leave empty to disable.
+embed_metadata = true
+embed_subtitles = true
+embed_thumbnail = true
+subtitle_languages = ["en", "de"]
+write_subtitles = true
 
 # SponsorBlock post-processing.
-sponsorblock_enabled = true
+sb_force_keyframe_at_cut = true # Slow: cuts require a re-encode.
 sponsorblock_categories = [
   "sponsor",
   "selfpromo",
@@ -50,22 +59,19 @@ sponsorblock_categories = [
   "intro",
   "outro",
 ]
-# Force keyframes at cuts when downloading/splitting/removing sections. This is slow due to needing a re-encode, but the resulting video may have fewer artifacts around the cuts
-sb_force_keyframe_at_cut = true
+sponsorblock_enabled = true
 
-# mark video as watched on YouTube
-mark_watched = false # NOT YET IMPLEMENTED
+# UI and browser behavior.
+close_tab_on_success = false # Not yet used by the current worker.
+print_command = false
 
-# Download output and local bookkeeping.
-output_template = "E:/downloads/%(title)s.%(ext)s"
+# Optional extra allowed Origins, e.g. if the extension sends from a content script.
+# allowed_origins = ["https://www.youtube.com"]
 
-archive_file = "archive.txt"   # Not yet used by the current worker.
-database_file = "downloads.db"
-
-js_runtime_loc = ".env/JSRUNTIME"
-ffprobe_loc = ".env/FFPROBE"
+# External tools.
 ffmpeg_loc = ".env/FFMPEG"
+ffprobe_loc = ".env/FFPROBE"
+js_runtime_loc = ".env/JSRUNTIME"
 
-# run yt-dlp in verbal mode (useful for debugging etc.)
-ytdlp_verbal = false
-progress = true
+# Audio remuxing.
+remux_audio = false # Not yet used by the current worker.

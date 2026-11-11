@@ -31,6 +31,13 @@ except Exception:
     
 from urllib.parse import urlparse, parse_qs
 
+from .download_worker import (
+    _fetch_video_title as _fetch_title,
+    _load_title_from_databank,
+    _write_title_to_databank,
+)
+from urllib.parse import quote
+
 
 _EPISODE_PREFIX_PATTERNS = (
     re.compile(r'(?i)\bS(?P<season>\d{1,2})\s*E(?P<episode>\d{1,3})\b'),
@@ -46,39 +53,6 @@ try:
 except Exception:
     pass
 
-def _check_url_name_databank(url: str | list[str]) -> str | None:
-    """Check if the URL is in the name databank. If so, return the title."""
-    if pathlib.Path(server_config.NAME_DATABANK_PATH).is_file():
-        try:
-            with open(server_config.NAME_DATABANK_PATH, 'r', encoding='utf-8') as f:
-                databank = json.load(f)
-                if isinstance(url, list):
-                    return [databank.get(u) for u in url]
-                elif isinstance(url, str):
-                    return databank.get(url)
-                else:
-                    raise TypeError("[select/_check_url_name_databank]: url must be a string or a list of strings")
-            return databank.get(url)
-        except Exception as e:
-            print('Failed to read name databank:', e)
-    return None
-
-def _write_title_to_databank(url, title):
-    """Write the URL and title to the name databank."""
-    databank = {}
-    if pathlib.Path(server_config.NAME_DATABANK_PATH).is_file():
-        try:
-            with open(server_config.NAME_DATABANK_PATH, 'r', encoding='utf-8') as f:
-                databank = json.load(f)
-        except Exception as e:
-            print('Failed to read name databank for writing:', e)
-    short_url = urlparse(url).query.split('v=')[-1] if 'v=' in url else url # store only the video ID
-    databank[short_url] = title
-    try:
-        with open(server_config.NAME_DATABANK_PATH, 'w', encoding='utf-8') as f:
-            json.dump(databank, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print('Failed to write to name databank:', e)
 
 def _process_url(url: str) -> str:
     """Clean up whitespace and remove unwanted YouTube URL parameters."""
@@ -132,9 +106,11 @@ def _detect_episode_prefix(title):
 def _post_selected_to_server(signal, selected):
     host = server_config.CONFIG.get('host', '127.0.0.1')
     port = server_config.CONFIG.get('port', 8765)
-    target = f"http://{host}:{port}/select/{signal}"
+    # quote(): the signal comes from the extension, don't let it alter the URL (S4)
+    target = f"http://{host}:{port}/select/{quote(str(signal), safe='')}"
     payload = json.dumps({"selected": selected}).encode('utf-8')
-    req = urllib.request.Request(target, data=payload, headers={"Content-Type": "application/json"}, method='POST')
+    headers = {"Content-Type": "application/json", **server_config.auth_headers()}
+    req = urllib.request.Request(target, data=payload, headers=headers, method='POST')
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, resp.read()
@@ -147,19 +123,20 @@ def _post_selected_to_server(signal, selected):
 def _get_title(url):
     url = _process_url(url)
 
-    title = _check_url_name_databank(url)
+    # _load_title_from_databank returns None for missing/"NA" entries, so those get re-fetched
+    title = _load_title_from_databank(url)
 
-    if not title or title == url or title.strip().upper() in {"NA", "N/A", "NONE"}:
+    if not title:
         title = _fetch_title(url)
 
         if title and title != url and title.strip().upper() not in {"NA", "N/A", "NONE"}:
             _write_title_to_databank(url, title)
 
-    return title
+    return title or url
 
 
 def show_selection_window(signal, urls):
-    print("[SELECT] Fetching video titles...\n")
+    print("[SELECT]  Fetching video titles...\n")
 
     titles = [None] * len(urls)
 
@@ -177,7 +154,7 @@ def show_selection_window(signal, urls):
         ):
             i = futures[future]
             titles[i] = future.result()
-    
+    print()
 
     root = ctk.CTk()
     root.title(f"Select Videos — {signal}")
