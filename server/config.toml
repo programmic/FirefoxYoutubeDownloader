@@ -18,23 +18,34 @@ cookies_from_browser = true
 # Video and audio format selection.
 max_resolution = "1920x1080" # Height (1080), yt format (1920p), or resolution (1920x1080).
 p_acodec = "mp4a"
-p_vcodec = "avc1"
+p_vcodec = "hvec"
 preferred_audio_container = "opus" # Not yet used by the current worker.
 preferred_video_container = ["mp4", "webm", "mkv"]
 
 # Final encode: one ffmpeg pass performs the SponsorBlock cut, loudnorm,
 # and compression.
 audio_bitrate = "96k" # Opus.
-avoid_size_increase = true # Retry once at a higher CRF when encoding expands the source.
+avoid_size_increase = true # Never publish a result larger than the download: short CRF search, then one full encode. Off: one encode at video_crf, any size.
+on_size_fail = "keep_source" # If even max_crf is not smaller than the download: "keep_source" | "fail" | "encode_anyway".
+crf_search_only = false # true = only run the CRF search, print the table, keep the download. For calibration.
+crf_search_samples = 6 # Sample clips per CRF trial, spread over the video. 0 = no search (the first full encode is the measurement).
+crf_search_seconds = 10 # Length of each sample clip. Longer = more accurate but slower.
+max_encode_attempts = 3 # Full encodes per video (the CRF search normally makes 1 enough).
+stats_interval = 300 # Seconds between permanent status lines during a full encode; 0 = off.
+# Calibration run (about 10-15 min per video, nothing is encoded in full): temporarily set
+#   max_crf = 50, crf_search_only = true
+# queue one video and read the "Attempts" table to see which CRF gives which size, then pick your real max_crf.
 compress = true
-ffmpeg_threads = 1 # Bound decoder/filter memory for long AV1 sources.
+ffmpeg_threads = 0 # 0 lets FFmpeg use the available CPU; set a positive value to cap it.
 merge_final = true
 normalize_audio = -16 # LUFS (-30..-5). Remove the key to disable.
 recode_video = false # yt-dlp must not re-encode; the final pass does that.
 remux_video = false
-video_codec = "av1" # "av1" | "hevc" | "h264".
-video_crf = 30 # AV1 ~30-34, HEVC ~24-28, H.264 ~21-24; lower = bigger/better.
-video_preset = 4 # SVT-AV1: 0-13; x265/x264: "slow", "slower", ...
+video_codec = "hevc" # "av1" | "hevc" | "h264".
+video_pixel_format = "yuv420p" # "yuv420p10le" = 10-bit | "yuv420p" = 8-bit.
+video_crf = 25 # AV1 ~30-34, HEVC ~24-28, H.264 ~21-24; lower = bigger/better. Your preferred quality: kept whenever the result is smaller than the download.
+max_crf = 32 # WORST quality you accept. CRF is raised above video_crf only as far as needed to end up smaller than the download, never above this. (Was spelled max_CRF; TOML keys are case-sensitive.)
+video_preset = 4
 
 # Download output and bookkeeping.
 # Max 150 bytes of title so Windows paths stay valid (H11).

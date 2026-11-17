@@ -85,6 +85,20 @@ class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
         self.assertIn('libsvtav1', video_args)
         self.assertEqual(pixel_format, 'yuv420p10le')
 
+    def test_final_encode_allows_configured_eight_bit_pixel_format(self):
+        for codec in ('av1', 'hevc', 'h264'):
+            with self.subTest(codec=codec):
+                _, pixel_format = download_worker._video_codec_args({
+                    'video_codec': codec,
+                    'video_pixel_format': 'yuv420p',
+                })
+
+                self.assertEqual(pixel_format, 'yuv420p')
+
+    def test_final_encode_rejects_unknown_pixel_format(self):
+        with self.assertRaisesRegex(ValueError, 'video_pixel_format'):
+            download_worker._video_codec_args({'video_pixel_format': 'rgb24'})
+
     def test_source_frame_rate_rejects_invalid_encoder_rate(self):
         self.assertEqual(
             download_worker._source_frame_rate({'r_frame_rate': '30/1'}),
@@ -93,6 +107,17 @@ class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             download_worker._source_frame_rate({'r_frame_rate': '1000/1'}),
         )
+
+    def test_video_frame_count_uses_ffprobe_frame_fields(self):
+        self.assertEqual(
+            download_worker._video_frame_count({'nb_frames': '120'}),
+            120,
+        )
+        self.assertEqual(
+            download_worker._video_frame_count({'nb_frames': 'N/A', 'nb_read_frames': '90'}),
+            90,
+        )
+        self.assertIsNone(download_worker._video_frame_count({'nb_frames': 'N/A'}))
 
     def test_filter_graph_normalizes_video_frame_rate(self):
         graph = download_worker._build_filter_graph(
@@ -107,7 +132,7 @@ class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
     def test_oversized_encode_gets_one_higher_crf_retry(self):
         self.assertEqual(
             download_worker._higher_crf({'video_crf': 30}),
-            34,
+            38,
         )
         self.assertEqual(
             download_worker._higher_crf({'video_crf': 50}),
@@ -115,6 +140,15 @@ class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(
             download_worker._higher_crf({'video_crf': 51}),
+        )
+        self.assertEqual(download_worker._higher_crf({}, 38), 46)
+        self.assertEqual(download_worker._higher_crf({}, 46), 51)
+        self.assertIsNone(download_worker._higher_crf({}, 51))
+
+    def test_ffmpeg_resource_args_allow_automatic_threading(self):
+        self.assertEqual(
+            download_worker._ffmpeg_resource_args({'ffmpeg_threads': 0}),
+            ['-threads', '0', '-filter_threads', '0', '-filter_complex_threads', '0'],
         )
 
     def test_ffmpeg_progress_accepts_numeric_timestamps(self):
@@ -241,7 +275,6 @@ class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
         self.assertIn('--sub-langs', args)
         self.assertIn('en,de', args)
         self.assertNotIn('--write-auto-subs', args)
-
 
 class TestShutdownOnIdle(unittest.TestCase):
     def test_shutdown_option_requires_positive_minutes(self):

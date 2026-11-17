@@ -2,11 +2,14 @@
  
 import asyncio
 import json
+import math
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
+import time
 from collections import deque
 from fractions import Fraction
 from pathlib import Path
@@ -29,12 +32,33 @@ _EPISODE_PREFIX_PATTERNS = (
  
 _RUNTIME_TITLE_CACHE = {}
  
-_SB_CHAPTER_PREFIX = "[SponsorBlock]"
+_SB_CHAPTER_PREFIX = f"{'[SponsorBlock]':<15}"
+MARKER_DOWNLOAD = f"{'[DOWNLOAD]':<15}"
 _FINAL_CONTAINER = "mkv"            # holds AV1/HEVC + Opus + srt + chapters + cover cleanly
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
 _DATABANK_LOCK = threading.Lock()
 _DOWNLOAD_SLOTS = None              # created lazily, see _get_download_slots()
 _SRT_TIME_RE = re.compile(r"(\d+):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d+):(\d{2}):(\d{2})[,.](\d{3})")
+
+# Size policy of the final encode (see _encode_to_size_target)
+_DEFAULT_CRF = {"av1": 30, "hevc": 25, "h264": 22}
+_CRF_HARD_LIMIT = {"av1": 63, "hevc": 51, "h264": 51}        # highest CRF the encoder accepts
+# ln(size) lost per +1 CRF. Only a first guess (av1: measured ~0.05 on test clips, x264/x265: size halves per ~6 CRF);
+# the search measures the real slope.
+_DEFAULT_SLOPE = {"av1": 0.05, "hevc": 0.115, "h264": 0.115}
+_ON_SIZE_FAIL_CHOICES = ("keep_source", "fail", "encode_anyway")
+_SEARCH_MAX_TRIALS = 4
+_SEARCH_SAFETY = 0.90         # the search wants an estimate <= 90 % of the source. Independently encoded short clips run a few % below a real
+                              # encode (measured: ~9 % with 5 s clips), and a full encode that ends up larger costs hours, 10 % margin costs ~1 CRF.
+_SKIP_MARGIN = 1.15           # estimate at max_crf this far above the limit -> don't even start the full encode
+_ABORT_MIN_FRACTION = 0.30    # earliest progress at which a hopeless full encode may be stopped
+_ABORT_MIN_DURATION = 600     # ... and only for videos this long (s); the muxer buffers a few seconds of output, which skews the live size of short files
+_ABORT_MARGIN = 1.15          # ... when its projected size exceeds the limit by this factor
+_SAMPLE_MAX_SHARE = 0.40      # sample clips may cover at most this share of the video
+_SAMPLE_MIN_SECONDS = 3.0
+_PROGRESS_KEYS = {"frame", "fps", "bitrate", "total_size", "out_time_us", "out_time_ms", "out_time",
+                  "dup_frames", "drop_frames", "speed", "progress"}
+_WARNED_CONFIG = set()
  
  
 def _build_ytdlp_auth_args(config, silence="quiet"):
@@ -440,44 +464,44 @@ def _classify_ytdlp_failure(output):
         return "post"
     return "other"
  
- 
-# ---------------------------------------------------------------------------
-# Single-pass encode: SponsorBlock cut + loudnorm + final compression
-#
-# yt-dlp only *marks* sponsor segments as chapters. We then cut them ourselves in
-# ONE ffmpeg pass that trims video and audio with the same timestamps (no A/V drift)
-# and applies the final encode, so there is only one lossy generation.
-# ffmpeg can't re-time chapters/subtitles after a cut, so that is done in Python.
-# ---------------------------------------------------------------------------
- 
-def _video_codec_args(config):
+
+def _video_codec_args(config, crf=None):
     """(encoder args, pixel format) for the single final encode.
-    Software encoders at slow presets give the smallest files for a given quality."""
+    Software encoders at slow presets give the smallest files for a given quality.
+    `crf` overrides video_crf (used by the CRF search and the corrective re-encodes)."""
     codec = str(config.get("video_codec", "h264")).lower()
-    crf = config.get("video_crf")
+    default_pixel_format = "yuv420p10le" if codec in ("av1", "hevc") else "yuv420p"
+    pixel_format = str(config.get("video_pixel_format", default_pixel_format)).lower()
+    if pixel_format not in {"yuv420p", "yuv420p10le"}:
+        raise ValueError(
+            f"Unknown video_pixel_format {pixel_format!r} "
+            "(use yuv420p for 8-bit or yuv420p10le for 10-bit)"
+        )
+    if crf is None:
+        crf = config.get("video_crf")
     preset = config.get("video_preset")
  
     if codec == "av1":
         return [
             "-c:v", "libsvtav1",
             "-preset", str(4 if preset is None else preset),
-            "-crf", str(30 if crf is None else crf),
+            "-crf", str(_DEFAULT_CRF["av1"] if crf is None else crf),
             "-svtav1-params", "tune=0",  # tune for visual quality instead of PSNR
-        ], "yuv420p10le"  # 10-bit avoids banding and compresses better
+        ], pixel_format
     if codec == "hevc":
         return [
             "-c:v", "libx265",
             "-preset", str("slow" if preset is None else preset),
-            "-crf", str(25 if crf is None else crf),
+            "-crf", str(_DEFAULT_CRF["hevc"] if crf is None else crf),
             "-tag:v", "hvc1",  # Apple players need this tag
             "-x265-params", "log-level=error",
-        ], "yuv420p10le"
+        ], pixel_format
     if codec == "h264":
         return [
             "-c:v", "libx264",
             "-preset", str("slower" if preset is None else preset),
-            "-crf", str(22 if crf is None else crf),
-        ], "yuv420p"
+            "-crf", str(_DEFAULT_CRF["h264"] if crf is None else crf),
+        ], pixel_format
     raise ValueError(f"Unknown video_codec {codec!r} (use av1, hevc or h264)")
  
  
@@ -487,25 +511,181 @@ def _audio_codec_args(config):
     return ["-c:a", "libopus", "-b:a", bitrate, "-vbr", "on", "-application", "audio"]
 
 
-def _higher_crf(config):
-    """Return one quality step that is more likely to reduce an oversized output."""
+def _warn_once(key, message):
+    """Print a configuration warning only once per process (the worker re-reads CONFIG for every video)."""
+    if key not in _WARNED_CONFIG:
+        _WARNED_CONFIG.add(key)
+        print(message)
+
+
+def _config_get(config, name, default=None):
+    """config.get() that tolerates a differently cased key.
+    TOML keys are case-sensitive: `max_CRF = 32` was silently ignored by config.get("max_crf")."""
+    if name in config:
+        return config[name]
+    for key, value in config.items():
+        if str(key).lower() == name.lower():
+            _warn_once(f"case:{name}", f"[CONFIG] Key {key!r} should be spelled {name!r}; using it anyway.")
+            return value
+    return default
+
+
+def _config_number(config, name, default, kind=float, minimum=None):
+    """Read a numeric setting; a missing or invalid value falls back to `default` with a warning."""
+    raw = _config_get(config, name)
+    if raw is None:
+        return default
     try:
-        current = int(config.get("video_crf", 30))
+        value = kind(raw)
+        if kind is float and not math.isfinite(value):
+            raise ValueError("not finite")
     except (TypeError, ValueError):
+        _warn_once(f"bad:{name}", f"[CONFIG] {name} = {raw!r} is not a valid number; using {default}.")
+        return default
+    if minimum is not None and value < minimum:
+        _warn_once(f"low:{name}", f"[CONFIG] {name} = {raw!r} is below the minimum of {minimum}; using {default}.")
+        return default
+    return value
+
+
+def _resolve_crf_range(config):
+    """(first CRF to try, highest CRF allowed). The first CRF is the user's preferred quality (video_crf);
+    max_crf is a hard ceiling that the search and every retry must respect."""
+    codec = str(config.get("video_codec", "h264")).lower()
+    hard_limit = _CRF_HARD_LIMIT.get(codec, 51)
+    start = min(_config_number(config, "video_crf", _DEFAULT_CRF.get(codec, 22), int, 0), hard_limit)
+    if _config_get(config, "max_crf") is None:
+        ceiling = min(start + 8, hard_limit)
+        _warn_once("max_crf-unset", f"[CONFIG] max_crf is not set; allowing CRF {start}..{ceiling}.")
+    else:
+        ceiling = _config_number(config, "max_crf", min(start + 8, hard_limit), int, 0)
+        if ceiling > hard_limit:
+            _warn_once("max_crf-high", f"[CONFIG] max_crf {ceiling} exceeds the {codec} encoder limit; using {hard_limit}.")
+            ceiling = hard_limit
+    if ceiling < start:
+        _warn_once("max_crf-low", f"[CONFIG] max_crf ({ceiling}) is below video_crf ({start}); using {start}.")
+        ceiling = start
+    return start, ceiling
+
+
+def _resolve_on_size_fail(config):
+    value = str(config.get("on_size_fail", "keep_source")).strip().lower()
+    if value not in _ON_SIZE_FAIL_CHOICES:
+        _warn_once("on_size_fail", f"[CONFIG] on_size_fail = {value!r} is invalid (use one of "
+                                    f"{', '.join(_ON_SIZE_FAIL_CHOICES)}); using 'keep_source'.")
+        return "keep_source"
+    return value
+
+
+def _parse_bitrate(value):
+    """'96k' / '96000' / '1.5M' -> bits per second, or None."""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*", str(value))
+    if not match:
         return None
-    if current >= 51:
-        return None
-    return min(current + 4, 51)
+    return float(match.group(1)) * {"": 1, "k": 1_000, "m": 1_000_000}[match.group(2).lower()]
+
+
+def _format_duration(seconds):
+    if seconds is None or seconds != seconds or seconds < 0:
+        return "?"
+    seconds = int(round(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def _pick_sample_windows(keep, count, length):
+    """Evenly spread (source_start, seconds) clips over the KEPT part of the video, each inside one kept range
+    (so a clip never contains a removed SponsorBlock segment). Returns [] when the video is too short."""
+    total = sum(b - a for a, b in keep)
+    if count < 1 or total <= 0:
+        return []
+    length = min(float(length), total * _SAMPLE_MAX_SHARE / count)
+    if length < _SAMPLE_MIN_SECONDS:
+        return []
+    windows = []
+    for i in range(count):
+        out_start = min(max(total * (i + 0.5) / count - length / 2, 0.0), total - length)
+        offset = 0.0
+        for n, (a, b) in enumerate(keep):
+            if out_start < offset + (b - a) or n == len(keep) - 1:
+                src_start = a + max(out_start - offset, 0.0)
+                if src_start + length > b:          # keep the clip inside this kept range
+                    src_start = max(a, b - length)
+                seconds = min(length, b - src_start)
+                if seconds >= _SAMPLE_MIN_SECONDS and (not windows or src_start >= windows[-1][0] + windows[-1][1]):
+                    windows.append((src_start, seconds))
+                break
+            offset += b - a
+    return windows
+
+
+def _crf_for_ratio(points, goal, default_slope):
+    """CRF at which size/reference is expected to equal `goal`.
+    ln(size) is close to linear in CRF, so two measurements are interpolated (or extrapolated) in log space;
+    with a single measurement `default_slope` (ln-size lost per CRF step) stands in for the unknown slope."""
+    def ln(ratio):
+        return math.log(max(ratio, 1e-6))
+
+    items = sorted(points.items())
+    ln_goal = ln(goal)
+    if len(items) >= 2:
+        under = [it for it in items if it[1] <= goal]
+        over = [it for it in items if it[1] > goal]
+        pair = None
+        if under and over:                          # prefer the two points that enclose the goal
+            lowest_under = min(under)
+            below = [it for it in over if it[0] < lowest_under[0]]
+            if below:
+                pair = (max(below), lowest_under)
+        if pair is None:                            # otherwise the two points closest to the goal
+            pair = tuple(sorted(sorted(items, key=lambda it: abs(ln(it[1]) - ln_goal))[:2]))
+        (c1, r1), (c2, r2) = pair
+        if c2 > c1:
+            slope = (ln(r1) - ln(r2)) / (c2 - c1)
+            if slope >= 0.01:                       # a flat or inverted curve is measurement noise
+                return c1 + (ln(r1) - ln_goal) / slope
+    crf, ratio = min(items, key=lambda it: abs(ln(it[1]) - ln_goal))
+    return crf + (ln(ratio) - ln_goal) / default_slope
+
+
+class _SizeModel:
+    """crf -> size / reference size. `samples` are estimates from short clips, `full` are real (or projected)
+    results of full encodes. A full result at the same CRF calibrates every sample estimate."""
+
+    def __init__(self, default_slope):
+        self.default_slope = default_slope
+        self.samples = {}
+        self.full = {}
+
+    def bias(self):
+        common = [c for c in self.full if c in self.samples]
+        if not common:
+            return 1.0
+        return math.exp(sum(math.log(self.full[c] / self.samples[c]) for c in common) / len(common))
+
+    def points(self):
+        bias = self.bias()
+        points = {crf: ratio * bias for crf, ratio in self.samples.items()}
+        points.update(self.full)
+        return points
+
+    def crf_for(self, goal):
+        return _crf_for_ratio(self.points(), goal, self.default_slope)
 
 
 def _ffmpeg_resource_args(config):
     """Keep decode/filter buffering bounded for long AV1 sources."""
     try:
-        threads = int(config.get("ffmpeg_threads", 1))
+        threads = int(config.get("ffmpeg_threads", 0))
     except (TypeError, ValueError) as e:
-        raise ValueError("ffmpeg_threads must be a positive integer") from e
-    if threads < 1:
-        raise ValueError("ffmpeg_threads must be a positive integer")
+        raise ValueError("ffmpeg_threads must be a non-negative integer") from e
+    if threads < 0:
+        raise ValueError("ffmpeg_threads must be a non-negative integer")
     return [
         "-threads", str(threads),
         "-filter_threads", str(threads),
@@ -554,8 +734,10 @@ def _resolve_ffmpeg_tools(ffmpeg_location):
  
  
 async def _probe_json(ffprobe, path, *flags):
+    cmd = [ffprobe, "-v", "error", *flags, "-of", "json", str(path)]
+    _print_command(cmd)
     proc = await asyncio.create_subprocess_exec(
-        ffprobe, "-v", "error", *flags, "-of", "json", str(path),
+        *cmd,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     stdout, _ = await proc.communicate()
@@ -699,8 +881,22 @@ def _source_frame_rate(stream):
     return None
  
  
+def _video_frame_count(stream):
+    """Return a stream's frame count when ffprobe provided one."""
+    for key in ("nb_frames", "nb_read_frames"):
+        value = stream.get(key)
+        try:
+            frame_count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if frame_count > 0:
+            return frame_count
+    return None
+
+
 async def _run_capture(cmd):
     """Run a command to completion; returns (exit code, stderr text). Cancel-safe."""
+    _print_command(cmd)
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
@@ -712,101 +908,464 @@ async def _run_capture(cmd):
     return proc.returncode, stderr.decode("utf-8", errors="replace")
  
  
-async def _run_ffmpeg(cmd, duration, desc="Encode"):
+def _print_command(cmd):
+    if config_module.CONFIG.get("print_command"):
+        print(*cmd)
+        print("============================")
+ 
+ 
+def _is_progress_key(key):
+    return key in _PROGRESS_KEYS or key.startswith("stream_")
+
+
+async def _run_ffmpeg_stream(cmd, on_progress=None):
+    """Run ffmpeg (started with `-progress pipe:1`) and call on_progress(dict) for every progress block.
+    If the callback returns True the process is stopped. Returns (exit code, last output lines, aborted)."""
+    _print_command(cmd)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
- 
-    progress_data = {}
-    output_tail = []
-    last_elapsed = 0.0
- 
-    bar_format = (
-        "{desc}: {percentage:6.2f}%|{bar}| "
-        "{n:.1f}/{total:.1f}s "
-        "[{elapsed}<{remaining}] {postfix}"
-    )
- 
+    block = {}
+    output_tail = deque(maxlen=30)
+    aborted = False
     try:
-        with tqdm(
-            total=max(duration, 0.001),
-            desc=desc,
-            unit="s",
-            dynamic_ncols=True,
-            bar_format=bar_format,
-            leave=True,
-        ) as bar:
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
- 
-                line = line.decode(errors="replace").strip()
-                if not line:
-                    continue
- 
-                if "=" not in line:
-                    output_tail.append(line)
-                    output_tail = output_tail[-30:]
-                    continue
- 
-                key, value = line.split("=", 1)
-                progress_data[key] = value
- 
-                if key != "progress":
-                    continue
-
-                try:
-                    elapsed = _progress_elapsed(progress_data, duration)
-                    if elapsed is not None:
-                        if elapsed > last_elapsed:
-                            bar.update(elapsed - last_elapsed)
-                            last_elapsed = elapsed
- 
-                    speed = progress_data.get("speed", "N/A")
-                    frame = progress_data.get("frame", "0")
- 
-                    bar.set_postfix_str(
-                        f"{speed} | frame {frame}",
-                        refresh=True,
-                    )
- 
-                except (ValueError, TypeError):
-                    pass
- 
-                progress_data = {}
- 
-            returncode = await proc.wait()
- 
-            if returncode == 0:
-                # Finish cleanly despite small timestamp/rounding differences.
-                if bar.n < bar.total:
-                    bar.update(bar.total - bar.n)
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                break
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                continue
+            key, sep, value = line.partition("=")
+            if not sep or not _is_progress_key(key):
+                output_tail.append(line)             # error text, never swallowed as "progress"
+                continue
+            block[key] = value
+            if key != "progress":
+                continue
+            snapshot, block = block, {}
+            if on_progress is not None and on_progress(snapshot):
+                aborted = True
+                await _stop_process(proc)
+                break
+        returncode = await proc.wait()
     except asyncio.CancelledError:
         # a timeout/cancel must not leave an orphaned encode running (H1)
         await _stop_process(proc)
         raise
- 
+    return returncode, "\n".join(output_tail), aborted
+
+
+def _progress_size(progress, out_path):
+    """Bytes written so far: the real file size if we know the file, else ffmpeg's own counter."""
+    if out_path is not None:
+        try:
+            return Path(out_path).stat().st_size
+        except OSError:
+            pass
+    try:
+        return int(progress.get("total_size"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _progress_fps(progress):
+    try:
+        fps = float(progress.get("fps"))
+    except (TypeError, ValueError):
+        return None
+    return fps if fps > 0 else None
+
+
+def _progress_speed(progress):
+    speed = (progress.get("speed") or "").strip()
+    return "" if speed in ("", "N/A") else speed
+
+
+async def _measure_samples(ctx, windows, crf, label):
+    """Encode the short sample clips at `crf` (same codec, preset and filters as the real encode) and
+    extrapolate the size of the finished file. Returns a dict with the estimate and timing statistics."""
+    config = ctx["config"]
+    vargs, _ = _video_codec_args(config, crf=crf)
+    filters = ([f"fps={ctx['frame_rate']}"] if ctx["frame_rate"] else []) + [f"format={ctx['pix_fmt']}"]
+    total_seconds = sum(seconds for _, seconds in windows)
+    started = time.monotonic()
+    sample_bytes = 0
+    frames = 0
+    bar_format = "{desc}: {percentage:5.1f}%|{bar}| [{elapsed}<{remaining}] {postfix}"
+    with tqdm(
+        total=total_seconds, desc=f"{label} CRF {crf}", unit="s",
+        dynamic_ncols=True, bar_format=bar_format, file=sys.stdout, leave=False,
+    ) as bar:
+        for number, (start, seconds) in enumerate(windows, 1):
+            clip = ctx["workdir"] / f"sample_crf{crf}_{number}.mkv"
+            cmd = [
+                ctx["ffmpeg"], "-y", "-hide_banner", "-loglevel", "error",
+                *_ffmpeg_resource_args(config),
+                "-progress", "pipe:1", "-stats_period", "0.5", "-nostats",
+                "-ss", f"{start:.3f}", "-t", f"{seconds:.3f}", "-i", str(ctx["path"]),
+                "-map", f"0:{ctx['video_idx']}", "-sn", "-dn",
+                "-vf", ",".join(filters),
+                "-threads", str(config.get("ffmpeg_threads", 0)),
+                *vargs, "-f", "matroska", str(clip),
+            ]
+            clip_done = 0.0
+            clip_frames = 0
+
+            def on_progress(progress):
+                nonlocal clip_done, clip_frames
+                elapsed = _progress_elapsed(progress, seconds)
+                if elapsed is not None and elapsed > clip_done:
+                    bar.update(elapsed - clip_done)
+                    clip_done = elapsed
+                try:
+                    clip_frames = int(progress.get("frame"))
+                except (TypeError, ValueError):
+                    pass
+                fps = _progress_fps(progress)
+                bar.set_postfix_str(
+                    f"clip {number}/{len(windows)} | {_progress_speed(progress)} "
+                    f"{'' if fps is None else f'{fps:.1f}fps'}".rstrip(),
+                    refresh=True,
+                )
+                return False
+
+            returncode, tail, _ = await _run_ffmpeg_stream(cmd, on_progress)
+            if returncode != 0:
+                clip.unlink(missing_ok=True)
+                raise RuntimeError(f"Sample encode failed (CRF {crf}, clip {number}/{len(windows)}):\n{tail[-800:]}")
+            if clip_done < seconds:
+                bar.update(seconds - clip_done)
+            sample_bytes += clip.stat().st_size
+            frames += clip_frames
+            clip.unlink(missing_ok=True)
+
+    wall = time.monotonic() - started
+    predicted = sample_bytes / total_seconds * ctx["output_duration"] + ctx["audio_bytes"]
+    return {
+        "predicted": predicted,
+        "ratio": predicted / ctx["ref_size"],
+        "wall": wall,
+        "seconds": total_seconds,
+        "fps": frames / wall if wall > 0 and frames else None,
+        # a full encode runs at about the same speed as the clips did
+        "full_eta": wall * ctx["output_duration"] / total_seconds,
+    }
+
+
+async def _run_ffmpeg(cmd, duration, total_frames=None, desc="Encode", *,
+                      out_path=None, ref_size=None, abort_above=None, snapshot_every=0.0):
+    """Run the final encode with a live progress bar.
+
+    Next to percent / ETA the bar shows speed, fps, the output size so far and the size it is heading for
+    (relative to `ref_size`). Every `snapshot_every` seconds a permanent status line is written above the bar,
+    so the log can be scrolled back later. If `abort_above` (bytes) is given and the projected final size
+    stays above it once enough of the video is done, the encode is stopped (it cannot succeed anyway).
+    Returns a statistics dict; raises RuntimeError if ffmpeg fails."""
+    use_frame_progress = total_frames is not None and total_frames > 0
+    progress_unit = "frame" if use_frame_progress else "s"
+    progress_unit_label = "frames" if use_frame_progress else "s"
+    bar_format = (
+        "{desc}: {percentage:6.2f}%|{bar}| "
+        "{n:.0f}/{total:.0f} " + progress_unit_label + " "
+        "[{elapsed}<{remaining}] {postfix}"
+    )
+    started = time.monotonic()
+    stats = {"aborted": False, "projected": None, "fraction": 0.0, "size": None, "frames": 0, "wall": 0.0}
+    last_snapshot = started
+    last_position = 0.0
+
+    with tqdm(
+        total=max(total_frames if use_frame_progress else duration, 1),
+        desc=desc,
+        unit=progress_unit,
+        dynamic_ncols=True,
+        bar_format=bar_format,
+        file=sys.stdout,
+        leave=True,
+    ) as bar:
+        def on_progress(progress):
+            nonlocal last_position, last_snapshot
+            elapsed = _progress_elapsed(progress, duration)
+            try:
+                frame = int(progress.get("frame"))
+            except (TypeError, ValueError):
+                frame = None
+
+            if use_frame_progress and frame is not None:
+                position = min(frame, bar.total)
+                stats["frames"] = max(stats["frames"], frame)
+            elif elapsed is not None:
+                position = elapsed / duration * bar.total if duration > 0 else 0.0
+            else:
+                position = None
+            if position is not None and position > last_position:
+                bar.update(position - last_position)
+                last_position = position
+
+            fraction = bar.n / bar.total if bar.total else 0.0
+            size = _progress_size(progress, out_path)
+            projected = size / fraction if size and fraction >= 0.02 else None
+            stats.update(fraction=fraction, size=size, projected=projected)
+
+            fps = _progress_fps(progress)
+            parts = [part for part in (_progress_speed(progress), None if fps is None else f"{fps:.1f}fps") if part]
+            text = " ".join(parts)
+            if size is not None:
+                size_text = _format_bytes(size)
+                if projected:
+                    size_text += f" -> ~{_format_bytes(projected)}"
+                    if ref_size:
+                        size_text += f" ({projected / ref_size:.0%} of source)"
+                text = f"{text} | {size_text}" if text else size_text
+            bar.set_postfix_str(text, refresh=True)
+
+            now = time.monotonic()
+            if snapshot_every and now - last_snapshot >= snapshot_every:
+                last_snapshot = now
+                spent = now - started
+                eta = spent * (1 - fraction) / fraction if fraction > 0 else None
+                line = (f"[{time.strftime('%H:%M:%S')}] {desc}: {fraction:.1%} | elapsed {_format_duration(spent)}"
+                        f" | ETA {_format_duration(eta)}")
+                if size is not None:
+                    line += f" | {_format_bytes(size)} written"
+                if projected:
+                    line += f" | projected {_format_bytes(projected)}"
+                    if ref_size:
+                        line += f" = {projected / ref_size:.0%} of source"
+                tqdm.write(line, file=sys.stdout)
+
+            if (abort_above is not None and projected is not None
+                    and fraction >= _ABORT_MIN_FRACTION and projected > abort_above):
+                stats["aborted"] = True
+                return True
+            return False
+
+        returncode, tail, aborted = await _run_ffmpeg_stream(cmd, on_progress)
+        stats["wall"] = time.monotonic() - started
+        if aborted:
+            tqdm.write(
+                f"[ENCODE] {desc}: stopped at {stats['fraction']:.0%}; projected size "
+                f"{_format_bytes(stats['projected'])} is far above the limit "
+                f"({_format_bytes(abort_above)} incl. margin).",
+                file=sys.stdout,
+            )
+            return stats
+        if returncode == 0:
+            # Finish cleanly despite small timestamp/rounding differences.
+            if bar.n < bar.total:
+                bar.update(bar.total - bar.n)
+            stats["fraction"] = 1.0
+
     if returncode != 0:
-        error_text = "\n".join(output_tail)[-1000:]
         raise RuntimeError(
             f"FFmpeg {desc} failed (exit {returncode}):\n"
-            f"{error_text}"
+            f"{tail[-1000:]}"
         )
- 
- 
+    return stats
+
+
+def _print_attempts(rows):
+    """Table of everything that was measured or encoded for one video."""
+    if not rows:
+        return
+    labels = {"sample": "CRF search (estimate)", "full": "full encode", "partial": "stopped early (proj.)"}
+    print("[ENCODE] Attempts:")
+    print(f"  {'step':<22}{'CRF':>4}  {'size':>10}  {'of source':>9}  {'time':>10}")
+    for kind, crf, size, ratio, wall in rows:
+        print(f"  {labels[kind]:<22}{crf:>4}  {_format_bytes(size):>10}  {ratio:>9.0%}  {_format_duration(wall):>10}")
+
+
+async def _keep_source(path, ffmpeg, out_path):
+    """Use the untouched download as the result. Only a stream copy is needed if it is not an .mkv already."""
+    out_path.unlink(missing_ok=True)
+    if path.suffix.lower() == f".{_FINAL_CONTAINER}":
+        return path
+    # only stream types Matroska can hold (an mp4 may carry data/timecode tracks); text subtitles become srt
+    rc, err = await _run_capture([
+        ffmpeg, "-y", "-v", "error", "-i", str(path),
+        "-map", "0:v", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?", "-map_chapters", "0",
+        "-c", "copy", "-c:s", "srt", str(out_path),
+    ])
+    if rc != 0:
+        out_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Could not copy {path.name} into {_FINAL_CONTAINER}: {err.strip()[-300:]}")
+    return out_path
+
+
+async def _encode_to_size_target(*, config, ctx, make_cmd, windows, out_path, total_frames):
+    """Produce the final file at the best quality that is still SMALLER than the download.
+
+    There is no size target. video_crf is the quality you want; the CRF is raised only as far as needed
+    to end up below the source, and never above max_crf (the worst quality you accept).
+
+    1. CRF search: short clips spread over the video are encoded at a few CRF values (minutes, not hours)
+       to find the lowest CRF whose estimated size is clearly below the source.
+    2. One full encode at that CRF, with live size projection. A hopeless encode is stopped early.
+    3. If the finished file is still not smaller than the source, the real result calibrates the model and
+       at most `max_encode_attempts` - 1 corrective encodes follow, still capped by `max_crf`.
+
+    Returns (outcome, message); outcome is "accepted" (out_path holds the result), "rejected" (no
+    acceptable encode; the caller applies `on_size_fail`) or "search_only"."""
+    output_duration, ref_size = ctx["output_duration"], ctx["ref_size"]
+    codec = str(config.get("video_codec", "h264")).lower()
+    start_crf, max_crf = _resolve_crf_range(config)
+    snapshot_every = _config_number(config, "stats_interval", 300.0, float, 0.0)
+
+    if not config.get("avoid_size_increase", True):
+        # size policy switched off: one encode at video_crf, whatever size comes out
+        await _run_ffmpeg(
+            make_cmd(start_crf), duration=output_duration, total_frames=total_frames,
+            desc=f"Encode CRF {start_crf}", out_path=out_path, ref_size=ref_size, snapshot_every=snapshot_every,
+        )
+        return "accepted", f"avoid_size_increase is off; encoded once at CRF {start_crf}."
+
+    max_attempts = _config_number(config, "max_encode_attempts", 3, int, 1)
+    search_only = bool(config.get("crf_search_only", False))
+    accept_oversized = _resolve_on_size_fail(config) == "encode_anyway"
+    limit_ratio = 1.0                         # never publish more than the (cut-adjusted) download size
+    goal = limit_ratio * _SEARCH_SAFETY       # the search wants an estimate clearly below the limit
+    model = _SizeModel(_DEFAULT_SLOPE.get(codec, 0.1))
+    rows = []
+
+    def finish(outcome, message):
+        _print_attempts(rows)
+        return outcome, message
+
+    print(f"[PLAN] Must end up smaller than the source ({_format_bytes(ref_size * limit_ratio)} for the kept part). "
+          f"Best quality first: CRF {start_crf} (video_crf), raised only as far as needed, never above "
+          f"{max_crf} (max_crf) | preset {config.get('video_preset', 'default')}")
+
+    # ---------------------------------------------------------------- 1. CRF search on short clips
+    chosen = start_crf
+    if windows:
+        covered = sum(seconds for _, seconds in windows)
+        print(f"[SEARCH] Estimating size on {len(windows)} clip(s) ({covered:.0f}s of {output_duration:.0f}s), "
+              f"at most {_SEARCH_MAX_TRIALS} CRF values + the ceiling if needed.")
+
+        async def trial(crf, label):
+            result = await _measure_samples(ctx, windows, crf, label)
+            model.samples[crf] = result["ratio"]
+            rows.append(("sample", crf, result["predicted"], result["ratio"], result["wall"]))
+            speed = "" if result["fps"] is None else f" at {result['fps']:.1f} fps"
+            print(f"[{label.upper()}] CRF {crf}: estimated {_format_bytes(result['predicted'])} = {result['ratio']:.0%} "
+                  f"of the source (aiming for <= {goal:.0%}) | {result['seconds']:.0f}s of video in "
+                  f"{_format_duration(result['wall'])}{speed} | full encode would take ~{_format_duration(result['full_eta'])}")
+
+        candidate = start_crf
+        for number in range(1, _SEARCH_MAX_TRIALS + 1):
+            await trial(candidate, f"Search {number}/{_SEARCH_MAX_TRIALS}")
+            meets = sorted(c for c, r in model.samples.items() if r <= goal)
+            best = meets[0] if meets else None
+            if best is not None and (best == start_crf or best - 1 in model.samples):
+                break                                       # found the lowest CRF that is clearly small enough
+            if best is None and max_crf in model.samples:
+                break                                       # even the ceiling is not enough
+            too_big = [c for c, r in model.samples.items() if r > goal and (best is None or c < best)]
+            low_edge = max(too_big) + 1 if too_big else start_crf
+            high_edge = best - 1 if best is not None else max_crf
+            if low_edge > high_edge:
+                break
+            guess = math.ceil(model.crf_for(goal) - 1e-9)
+            candidate = min(max(guess, low_edge), high_edge)
+            if candidate in model.samples:
+                break
+        meets = sorted(c for c, r in model.samples.items() if r <= goal)
+        if not meets and max_crf not in model.samples:
+            await trial(max_crf, "Search ceiling")
+            meets = sorted(c for c, r in model.samples.items() if r <= goal)
+        reached = bool(meets)
+        chosen = meets[0] if meets else max_crf
+
+        if reached:
+            note = " - your video_crf already does it, no quality compromise needed" if chosen == start_crf else ""
+            print(f"[SEARCH] Chosen CRF {chosen}: estimated {model.samples[chosen]:.0%} of the source{note}.")
+        else:
+            message = (f"Even at max_crf {max_crf} the estimate is {model.samples[max_crf]:.0%} of the source "
+                       f"(aiming for <= {goal:.0%}).")
+            if max_crf - min(model.samples) >= 4:
+                message += f" The measured curve suggests CRF ~{model.crf_for(goal):.0f} would be needed."
+            print(f"[SEARCH] {message}")
+
+        if search_only:
+            return finish("search_only", "crf_search_only is enabled: no full encode was run.")
+        if not reached and not accept_oversized and model.samples[max_crf] > limit_ratio * _SKIP_MARGIN:
+            return finish("rejected", f"Even at max_crf {max_crf} the estimated size is "
+                                      f"{model.samples[max_crf]:.0%} of the source (limit {limit_ratio:.0%}).")
+    else:
+        print("[SEARCH] Skipped (video too short for sample clips, or crf_search_samples = 0); "
+              "the first full encode is used as the measurement.")
+        if search_only:
+            return finish("search_only", "crf_search_only is enabled but no sample clips could be taken.")
+
+    # ---------------------------------------------------------------- 2./3. full encode (+ corrections)
+    crf = chosen
+    attempt = 0
+    while True:
+        attempt += 1
+        out_path.unlink(missing_ok=True)
+        started = time.monotonic()
+        stats = await _run_ffmpeg(
+            make_cmd(crf), duration=output_duration, total_frames=total_frames,
+            desc=f"Encode CRF {crf} (try {attempt}/{max_attempts})",
+            out_path=out_path, ref_size=ref_size,
+            abort_above=(None if accept_oversized or output_duration < _ABORT_MIN_DURATION
+                         else ref_size * limit_ratio * _ABORT_MARGIN),
+            snapshot_every=snapshot_every,
+        )
+        wall = time.monotonic() - started
+        if stats["aborted"]:
+            size = stats["projected"]
+            ratio = size / ref_size
+            rows.append(("partial", crf, size, ratio, wall))
+            out_path.unlink(missing_ok=True)
+        else:
+            size = out_path.stat().st_size
+            ratio = size / ref_size
+            rows.append(("full", crf, size, ratio, wall))
+            speed = f" ({stats['frames'] / wall:.1f} fps)" if wall > 0 and stats["frames"] else ""
+            print(f"[ENCODE] CRF {crf}: {_format_bytes(size)} = {ratio:.0%} of the source "
+                  f"in {_format_duration(wall)}{speed}")
+            if crf in model.samples:
+                print(f"[ENCODE] The sample estimate for CRF {crf} was {model.samples[crf]:.0%}, the real result is "
+                      f"{ratio:.0%} (estimate off by {model.samples[crf] / ratio - 1:+.0%}).")
+        model.full[crf] = ratio
+
+        if not stats["aborted"] and ratio <= limit_ratio:
+            return finish("accepted", f"CRF {crf}: {ratio:.0%} of the source.")
+
+        if crf >= max_crf or attempt >= max_attempts:
+            if not stats["aborted"] and accept_oversized:
+                return finish("accepted", f"CRF {crf}: {ratio:.0%} of the source - larger than the download "
+                                          f"(on_size_fail = encode_anyway).")
+            why = "max_crf reached" if crf >= max_crf else f"max_encode_attempts ({max_attempts}) used up"
+            return finish("rejected", f"{why}; the encode at CRF {crf} is {ratio:.0%} of the source "
+                                      f"(limit {limit_ratio:.0%}).")
+
+        next_crf = min(max(math.ceil(model.crf_for(goal) - 1e-9), crf + 1), max_crf)
+        print(f"[ENCODE] Not smaller than the source; next try at CRF {next_crf} (calibrated with the real result).")
+        crf = next_crf
+
+
 async def _postprocess_video(path, ffmpeg_location=None, config=None):
     """Single ffmpeg pass over a downloaded file: SponsorBlock cut + loudnorm + final encode.
  
     One pass = only ONE lossy generation. ffmpeg can't re-time chapters/subtitles after a cut,
-    so that is done here in Python (H3). Returns the encoded temp file; the caller moves it."""
+    so that is done here in Python (H3). Returns the encoded temp file; the caller moves it.
+ 
+    With avoid_size_increase the CRF is chosen by _encode_to_size_target (short sample encodes instead of
+    blind full retries). If no acceptable encode exists, on_size_fail decides: "keep_source" returns the
+    untouched download, "fail" raises, "encode_anyway" accepts the encode at max_crf even if it is larger."""
     config = config if config is not None else getattr(config_module, "CONFIG", {})
     path = Path(path)
     ffmpeg, ffprobe = _resolve_ffmpeg_tools(ffmpeg_location)
  
+    print(f"[ENCODE] Analysing {path.name if len(path.name) <= 75 else path.name[:72] + '...'}")
     chapters = (await _probe_json(ffprobe, path, "-show_chapters")).get("chapters", [])
+    # No -count_frames: it decodes the whole file silently (minutes of black box). The output is resampled
+    # to a constant frame rate below, so duration x fps predicts its frame count at least as well.
     streams = (await _probe_json(ffprobe, path, "-show_streams")).get("streams", [])
     duration = float((await _probe_json(ffprobe, path, "-show_format"))["format"]["duration"])
  
@@ -818,9 +1377,8 @@ async def _postprocess_video(path, ffmpeg_location=None, config=None):
     )
     if video_idx is None or not any(st.get("codec_type") == "audio" for st in streams):
         raise RuntimeError(f"{path.name}: expected one video and one audio stream")
-    frame_rate = _source_frame_rate(
-        next(st for st in streams if st.get("index") == video_idx)
-    )
+    video_stream = next(st for st in streams if st.get("index") == video_idx)
+    frame_rate = _source_frame_rate(video_stream)
  
     # SponsorBlock marks -> ranges to cut -> inverted into ranges to keep
     cuts = _merge_ranges(
@@ -839,6 +1397,14 @@ async def _postprocess_video(path, ffmpeg_location=None, config=None):
         print(f"[SPONSORBLOCK] Whole video is marked as removable; ignoring the marks for {path.name}.")
         keep = [(0.0, duration)]
     output_duration = sum(b - a for a, b in keep)
+    if frame_rate is not None:
+        total_frames = max(1, round(output_duration * float(frame_rate)))
+    else:
+        source_frame_count = _video_frame_count(video_stream)
+        if source_frame_count is not None and duration > 0:
+            total_frames = max(1, round(source_frame_count * output_duration / duration))
+        else:
+            total_frames = None
  
     # validate the loudness target once (H4)
     loudness = None
@@ -855,12 +1421,27 @@ async def _postprocess_video(path, ffmpeg_location=None, config=None):
     vargs, pix_fmt = _video_codec_args(config)
     aargs = _audio_codec_args(config)
     out_path = path.with_name(f"{path.stem}.final.{_FINAL_CONTAINER}")
-    print(f"[ENCODE] {path.name if len(path.name) <= 75 else path.name[:72] + '...'}")
+
+    # What we are up against: the size the kept part of the download "should" have. Comparing with the whole
+    # file would be too generous whenever SponsorBlock removed something.
+    source_size = path.stat().st_size
+    ref_size = source_size * output_duration / duration if duration > 0 else float(source_size)
+    audio_bps = _parse_bitrate(config.get("audio_bitrate", "96k"))
+    if audio_bps is None:
+        _warn_once("audio_bitrate", f"[CONFIG] Cannot parse audio_bitrate {config.get('audio_bitrate')!r}; "
+                                    f"size estimates will ignore the audio track.")
+    audio_bytes = (audio_bps or 0.0) * output_duration / 8
+
+    print(f"[SOURCE] {video_stream.get('codec_name', '?')} {video_stream.get('width', '?')}x{video_stream.get('height', '?')}"
+          f" @ {frame_rate or '?'} fps | {_format_bytes(source_size)} = "
+          f"{source_size * 8 / duration / 1e6 if duration > 0 else 0:.2f} Mb/s overall | {duration / 60:.1f} min")
     print(f"[ENCODE] Cutting {len(cuts)} segment(s) | Kept ranges: {len(keep)} | Output duration: {output_duration:.2f}s")
  
     try:
         with tempfile.TemporaryDirectory(prefix="ytpost_") as tmp:
             workdir = Path(tmp)
+            prepare_started = time.monotonic()
+            print("[ENCODE] Preparing subtitles, chapters and loudness measurement...")
  
             # Subtitles: extract each track, shift its cues, feed it back in as an extra input
             sub_inputs = []
@@ -888,6 +1469,7 @@ async def _postprocess_video(path, ffmpeg_location=None, config=None):
             # Loudness: pass 1 measures the already-cut audio, pass 2 applies it linearly (more accurate)
             audio_filter = None
             if loudness is not None:
+                print("[NORMALIZE] Measuring loudness (audio-only pass, no progress available)...")
                 target = f"I={loudness}:TP=-1.5:LRA=11"
                 measure_script = workdir / "measure.txt"
                 measure_script.write_text(
@@ -914,6 +1496,7 @@ async def _postprocess_video(path, ffmpeg_location=None, config=None):
                     audio_filter = f"loudnorm={target},aresample=48000"
             else:
                 audio_filter = "aresample=48000"
+            print(f"[ENCODE] Preparation took {_format_duration(time.monotonic() - prepare_started)}.")
  
             # The graph goes through a file so long segment lists can't hit the command-line limit
             script_path = workdir / "graph.txt"
@@ -928,55 +1511,75 @@ async def _postprocess_video(path, ffmpeg_location=None, config=None):
                 encoding="utf-8",
             )
  
-            cmd = [
+            head = [
                 ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                 *_ffmpeg_resource_args(config),
                 "-progress", "pipe:1", "-stats_period", "0.5", "-nostats",
                 "-i", str(path),                              # input 0: the download
             ]
             for srt_path, _ in sub_inputs:                    # inputs 1..n: shifted subtitles
-                cmd += ["-i", str(srt_path)]
+                head += ["-i", str(srt_path)]
             if meta_path:                                     # input n+1: rebuilt chapters
-                cmd += ["-f", "ffmetadata", "-i", str(meta_path)]
+                head += ["-f", "ffmetadata", "-i", str(meta_path)]
  
-            cmd += ["-filter_complex_script", str(script_path), "-map", "[v]", "-map", "[a]"]
+            head += ["-filter_complex_script", str(script_path), "-map", "[v]", "-map", "[a]"]
             for i in range(len(sub_inputs)):
-                cmd += ["-map", f"{i + 1}:0"]
-            cmd += ["-map", "0:t?"]                           # cover art / attachments, copied untouched
-            cmd += ["-threads", str(config.get("ffmpeg_threads", 1))]
-            cmd += [*vargs, *aargs]
+                head += ["-map", f"{i + 1}:0"]
+            head += ["-map", "0:t?"]                          # cover art / attachments, copied untouched
+            head += ["-threads", str(config.get("ffmpeg_threads", 0))]   # output side: encoder threads
+
+            tail_args = []
             if sub_inputs:
-                cmd += ["-c:s", "srt"]
+                tail_args += ["-c:s", "srt"]
                 for i, (_, lang) in enumerate(sub_inputs):
-                    cmd += [f"-metadata:s:s:{i}", f"language={lang}"]
-            cmd += [
+                    tail_args += [f"-metadata:s:s:{i}", f"language={lang}"]
+            tail_args += [
                 "-map_metadata", "0",
                 "-map_chapters", str(len(sub_inputs) + 1) if meta_path else "-1",
                 str(out_path),
             ]
- 
-            await _run_ffmpeg(cmd, duration=output_duration, desc="Encode")
 
-            # CRF targets visual quality, not file size. A source selected by yt-dlp
-            # may already be more compressed than the requested CRF output, so avoid
-            # accepting a larger result when a single quality step can correct it.
-            if config.get("avoid_size_increase", True) and out_path.stat().st_size > path.stat().st_size:
-                higher_crf = _higher_crf(config)
-                crf_position = cmd.index("-crf") + 1 if "-crf" in cmd else None
-                if higher_crf is not None and crf_position is not None:
-                    print(
-                        f"[ENCODE] Output is larger than the source; retrying with CRF {higher_crf}."
-                    )
-                    cmd[crf_position] = str(higher_crf)
-                    out_path.unlink()
-                    await _run_ffmpeg(cmd, duration=output_duration, desc="Encode retry")
+            def make_cmd(crf):
+                """The complete final-encode command for one CRF value."""
+                crf_args, _ = _video_codec_args(config, crf=crf)
+                return [*head, *crf_args, *aargs, *tail_args]
+
+            windows = []
+            if config.get("avoid_size_increase", True):
+                windows = _pick_sample_windows(
+                    keep,
+                    _config_number(config, "crf_search_samples", 6, int, 0),
+                    _config_number(config, "crf_search_seconds", 15.0, float, 1.0),
+                )
+            ctx = {
+                "config": config, "ffmpeg": ffmpeg, "path": path, "video_idx": video_idx,
+                "pix_fmt": pix_fmt, "frame_rate": frame_rate, "workdir": workdir,
+                "output_duration": output_duration, "ref_size": ref_size, "audio_bytes": audio_bytes,
+            }
+            outcome, message = await _encode_to_size_target(
+                config=config, ctx=ctx, make_cmd=make_cmd, windows=windows,
+                out_path=out_path, total_frames=total_frames,
+            )
+            if outcome == "accepted":
+                print(f"[ENCODE] Accepted - {message}")
+                return out_path
+
+            # No acceptable encode exists.
+            out_path.unlink(missing_ok=True)
+            if outcome == "rejected" and _resolve_on_size_fail(config) == "fail":
+                raise RuntimeError(f"FFmpeg could not encode {path.name} without increasing size: {message}")
+            if outcome == "search_only":
+                print(f"[ENCODE] {message} Keeping the download unchanged.")
+            else:
+                print(f"\033[33m[ENCODE] {message} Keeping the download unchanged "
+                      f"(no SponsorBlock cut, no loudness normalisation).\033[0m")
+            return await _keep_source(path, ffmpeg, out_path)
     except BaseException:
         # includes cancellation: never leave half-written output behind
         out_path.unlink(missing_ok=True)
         raise
-    return out_path
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # yt-dlp download, retry ladder, status handling
 # ---------------------------------------------------------------------------
@@ -1027,7 +1630,7 @@ def _build_download_args(url, title, config, auth_args, ffmpeg_path, output_temp
         sb_categories = [c for c in config.get("sponsorblock_categories", [])
                          if c in config_module.SPONSORBLOCK_CATEGORIES]
         if not sb_categories:
-            print("[DOWNLOAD] SponsorBlock is enabled but no valid categories are set. Using all cuttable categories.")
+            print(f"{MARKER_DOWNLOAD}SponsorBlock is enabled but no valid categories are set. Using all cuttable categories.")
             sb_categories = list(config_module.SPONSORBLOCK_CATEGORIES)
         args.extend(["--sponsorblock-mark", ",".join(sb_categories)])
     if config.get("embed_chapters") or config.get("sponsorblock_enabled"):
@@ -1063,7 +1666,7 @@ async def _run_ytdlp(args, config):
                 break
  
             decoded_line = line.decode(errors="ignore").rstrip()
-            if not decoded_line.startswith("[download]"):  # progress spam would flood the tail
+            if not decoded_line.startswith(MARKER_DOWNLOAD):  # progress spam would flood the tail
                 tail.append(decoded_line)
  
             if verbose:
@@ -1071,9 +1674,26 @@ async def _run_ytdlp(args, config):
                 continue
  
             if show_progress:
-                if decoded_line.startswith("[download]"):
-                    print("\r\033[K" + decoded_line, end="", flush=True)
-                else:
+                if decoded_line.startswith(MARKER_DOWNLOAD):
+                    if show_progress:
+                        print("\r\033[K" + decoded_line, end="", flush=True)
+
+                elif decoded_line.startswith("[Merger]"):
+                    print(f"\n[YT-DLP] Merging: {decoded_line}")
+
+                elif decoded_line.startswith("[Metadata]"):
+                    print(f"\n[YT-DLP] Metadata: {decoded_line}")
+
+                elif decoded_line.startswith("[EmbedThumbnail]"):
+                    print(f"\n[YT-DLP] Thumbnail: {decoded_line}")
+
+                elif decoded_line.startswith("[EmbedSubtitle]"):
+                    print(f"\n[YT-DLP] Subtitles: {decoded_line}")
+
+                elif decoded_line.startswith("[Fixup"):
+                    print(f"\n[YT-DLP] Fixup: {decoded_line}")
+
+                elif decoded_line:
                     print(decoded_line)
             elif decoded_line.startswith(("ERROR", "WARNING")):
                 print(decoded_line)  # quiet mode must still surface problems
@@ -1104,7 +1724,8 @@ async def _download_async(url, database, title, config=None, auth_args=None):
     abrev_title: str = title if len(title) <= 75 else title[:72] + "..."
     print(f"{url}\n{abrev_title}")
     print(f"\033[37m[SYSTEM] Queue length: {len(database.get_queued())}\033[0m")
-    print("============================\n")
+    time_now: str = time.strftime("%y/%m/%d %H:%M", time.gmtime())
+    print("======", time_now, "======\n")
  
     # Retry ladder: full command -> relaxed format selector (format errors)
     # -> no embedded thumbnail/subs (post-processing errors). Each step is tried at most once.
@@ -1142,10 +1763,12 @@ async def _download_async(url, database, title, config=None, auth_args=None):
  
     if not downloaded_files:
         raise RuntimeError("yt-dlp finished but reported no output file")
+    else:
+        print(f"{MARKER_DOWNLOAD}raw download completed: {len(downloaded_files)} file(s) downloaded. Post-processing...")
  
     saved_bytes = 0
     final_paths = []
-    for downloaded in downloaded_files:
+    for num, downloaded in enumerate(downloaded_files):
         source = Path(downloaded)
         encoded = await _postprocess_video(source, ffmpeg_resolved, config)
         final = _unique_path(final_dir / f"{source.stem}.{_FINAL_CONTAINER}")
@@ -1158,8 +1781,9 @@ async def _download_async(url, database, title, config=None, auth_args=None):
         shutil.move(str(encoded), str(final))
         source.unlink(missing_ok=True)
         final_paths.append(final)
+        print(f"[POSTPROCESS] Completed {num + 1}/{len(downloaded_files)}: {final.name}")
  
-    print(f"\n[DOWNLOAD] Finished downloading: {url}")
+    print(f"\n{MARKER_DOWNLOAD}Finished downloading: {url}")
     database.set_filepath(url, str(final_paths[0]))
     database.update_status(url, "completed")
     return {
@@ -1180,10 +1804,10 @@ async def download_video(url, conf_args=None):
  
     async with _get_download_slots():
         if database.is_done(url):
-            print(f"[DOWNLOAD] Skipping already downloaded video: {url}")
+            print(f"{MARKER_DOWNLOAD}Skipping already downloaded video: {url}")
             return {'status': 'skipped', 'reason': 'already_downloaded', 'saved_bytes': 0}
         if not database.claim(url):
-            print(f"[DOWNLOAD] Skipping {url}: already being processed")
+            print(f"{MARKER_DOWNLOAD}Skipping {url}: already being processed")
             return {'status': 'skipped', 'reason': 'in_progress', 'saved_bytes': 0}
  
         try:
@@ -1246,4 +1870,3 @@ async def runall():
  
 if __name__ == "__main__":
     asyncio.run(runall())
- 
