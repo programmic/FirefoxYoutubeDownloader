@@ -19,6 +19,7 @@ from tqdm import tqdm
  
 from . import database as db
 from . import config as config_module
+from .logger import Log, Logger
  
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
  
@@ -107,6 +108,8 @@ def _build_ytdlp_auth_args(config, silence="quiet"):
             args.extend([
                 "--js-runtimes",
                 f"node:{js_runtime_path}",
+                "--remote-components",
+                "ejs:github",
             ])
         else:
             print_debug(
@@ -1757,6 +1760,8 @@ async def _download_async(url, database, title, config=None, auth_args=None):
         config = getattr(config_module, 'CONFIG', {})
     if auth_args is None:
         auth_args = _build_ytdlp_auth_args(config)
+    download_started = time.monotonic()
+    download_logger = Logger()
  
     # yt-dlp writes into a staging dir; only finished, encoded files ever appear in the library
     template = Path(config["output_template"])
@@ -1813,15 +1818,19 @@ async def _download_async(url, database, title, config=None, auth_args=None):
         raise RuntimeError("yt-dlp finished but reported no output file")
     else:
         print(f"{MARKER_DOWNLOAD}raw download completed: {len(downloaded_files)} file(s) downloaded. Post-processing...")
+    download_duration = time.monotonic() - download_started
  
     saved_bytes = 0
     final_paths = []
     for num, downloaded in enumerate(downloaded_files):
         source = Path(downloaded)
+        source_size = source.stat().st_size
+        encoding_started = time.monotonic()
         encoded = await _postprocess_video(source, ffmpeg_resolved, config)
+        encoding_duration = time.monotonic() - encoding_started
         final = _unique_path(final_dir / f"{source.stem}.{_FINAL_CONTAINER}")
  
-        source_size, encoded_size = source.stat().st_size, encoded.stat().st_size
+        encoded_size = encoded.stat().st_size
         saved_bytes += max(0, source_size - encoded_size)
         print(f"[ENCODE] {_format_bytes(source_size)} -> {_format_bytes(encoded_size)} "
               f"({encoded_size / max(source_size, 1):.0%} of the download)")
@@ -1831,6 +1840,23 @@ async def _download_async(url, database, title, config=None, auth_args=None):
         final_paths.append(final)
         print(f"[POSTPROCESS] Completed {num + 1}/{len(downloaded_files)}: {final.name}")
  
+        reduction = max(0, source_size - encoded_size) / max(source_size, 1) * 100
+        selected_sb_categories = config.get("sponsorblock_categories", [])
+        download_logger.new()
+        download_logger.current(Log.TIMESTAMP, time.strftime("%Y-%m-%d %H:%M:%S"))
+        download_logger.current(Log.DOWNLOAD_DURATION, f"{download_duration:.2f}s")
+        download_logger.current(Log.ENCODING_DURATION, f"{encoding_duration:.2f}s")
+        download_logger.current(Log.FILENAME, final.name)
+        download_logger.current(Log.URL, url)
+        download_logger.current(
+            Log.SBCUT,
+            ", ".join(selected_sb_categories) if config.get("sponsorblock_enabled") else "disabled",
+        )
+        download_logger.current(Log.ORIGINAL_SIZE, _format_bytes(source_size))
+        download_logger.current(Log.FINAL_SIZE, _format_bytes(encoded_size))
+        download_logger.current(Log.PERCENTAGE_REDUCTION, f"{reduction:.1f}")
+        download_logger.write()
+
     print(f"\n{MARKER_DOWNLOAD}Finished downloading: {url}")
     database.set_filepath(url, str(final_paths[0]))
     database.update_status(url, "completed")

@@ -48,7 +48,13 @@ class TestAppNano(unittest.TestCase):
                     'js_runtime_loc': '.env/TEST_JS_RUNTIME',
                 })
 
-                self.assertEqual(args, ['--js-runtimes', f'node:{runtime}'])
+                self.assertEqual(
+                    args,
+                    [
+                        '--js-runtimes', f'node:{runtime}',
+                        '--remote-components', 'ejs:github',
+                    ],
+                )
 
 class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
     def test_format_selector_prefers_original_audio_track(self):
