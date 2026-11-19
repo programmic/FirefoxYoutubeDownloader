@@ -46,6 +46,7 @@ video_pixel_format = "yuv420p" # "yuv420p10le" = 10-bit | "yuv420p" = 8-bit.
 video_crf = 25 # AV1 ~30-34, HEVC ~24-28, H.264 ~21-24; lower = bigger/better. Your preferred quality: kept whenever the result is smaller than the download.
 max_crf = 32 # WORST quality you accept. CRF is raised above video_crf only as far as needed to end up smaller than the download, never above this. (Was spelled max_CRF; TOML keys are case-sensitive.)
 video_preset = 4
+max_video_fps = 29.97 # 0 = no limit. If the source is higher, it will be downsampled to this.
 
 # Download output and bookkeeping.
 # Max 150 bytes of title so Windows paths stay valid (H11).

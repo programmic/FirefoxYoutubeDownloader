@@ -881,6 +881,15 @@ def _source_frame_rate(stream):
     return None
  
  
+def _resolve_frame_rate(stream, config):
+    """Return the source rate capped by max_video_fps, or None when no rate is usable."""
+    source_rate = _source_frame_rate(stream)
+    maximum = _config_number(config, "max_video_fps", 0.0, float, 0.0)
+    if maximum <= 0 or source_rate is None:
+        return source_rate
+    return f"{min(float(source_rate), maximum):.6f}".rstrip("0").rstrip(".")
+
+
 def _video_frame_count(stream):
     """Return a stream's frame count when ffprobe provided one."""
     for key in ("nb_frames", "nb_read_frames"):
@@ -955,7 +964,7 @@ async def _run_ffmpeg_stream(cmd, on_progress=None):
         # a timeout/cancel must not leave an orphaned encode running (H1)
         await _stop_process(proc)
         raise
-    return returncode, "\n".join(output_tail), aborted
+    return returncode, "".join(output_tail), aborted
 
 
 def _progress_size(progress, out_path):
@@ -1184,11 +1193,14 @@ async def _keep_source(path, ffmpeg, out_path):
     if path.suffix.lower() == f".{_FINAL_CONTAINER}":
         return path
     # only stream types Matroska can hold (an mp4 may carry data/timecode tracks); text subtitles become srt
-    rc, err = await _run_capture([
-        ffmpeg, "-y", "-v", "error", "-i", str(path),
-        "-map", "0:v", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?", "-map_chapters", "0",
-        "-c", "copy", "-c:s", "srt", str(out_path),
-    ])
+    try:
+        rc, err = await _run_capture([
+            ffmpeg, "-y", "-v", "error", "-i", str(path),
+            "-map", "0:v", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?", "-map_chapters", "0",
+            "-c", "copy", "-c:s", "srt", str(out_path),
+        ])
+    except Exception as e:
+        rc, err = 1, str(e)
     if rc != 0:
         out_path.unlink(missing_ok=True)
         raise RuntimeError(f"Could not copy {path.name} into {_FINAL_CONTAINER}: {err.strip()[-300:]}")
@@ -1378,7 +1390,7 @@ async def _postprocess_video(path, ffmpeg_location=None, config=None):
     if video_idx is None or not any(st.get("codec_type") == "audio" for st in streams):
         raise RuntimeError(f"{path.name}: expected one video and one audio stream")
     video_stream = next(st for st in streams if st.get("index") == video_idx)
-    frame_rate = _source_frame_rate(video_stream)
+    frame_rate = _resolve_frame_rate(video_stream, config)
  
     # SponsorBlock marks -> ranges to cut -> inverted into ranges to keep
     cuts = _merge_ranges(
@@ -1641,7 +1653,24 @@ def _build_download_args(url, title, config, auth_args, ffmpeg_path, output_temp
     args.extend(auth_args)
     args.extend(["--", url])  # "--" must stay last: the URL can never be parsed as an option (S2)
     return args
- 
+
+async def _read_output_lines(stream):
+    buffer = bytearray()
+
+    while True:
+        chunk = await stream.read(1)
+
+        if not chunk:
+            if buffer:
+                yield bytes(buffer)
+            break
+
+        if chunk in (b"\r", b"\n"):
+            if buffer:
+                yield bytes(buffer)
+                buffer.clear()
+        else:
+            buffer.extend(chunk)
  
 async def _run_ytdlp(args, config):
     """Run yt-dlp; returns (exit code, last output lines).
@@ -1653,6 +1682,19 @@ async def _run_ytdlp(args, config):
         print("============================")
  
     tail = deque(maxlen=30)
+    progress_width = 0
+
+    def clear_progress_line():
+        nonlocal progress_width
+        if progress_width:
+            sys.stdout.write("\r" + (" " * progress_width) + "\r")
+            sys.stdout.flush()
+            progress_width = 0
+
+    def print_status(message):
+        clear_progress_line()
+        print(message)
+
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
@@ -1660,45 +1702,48 @@ async def _run_ytdlp(args, config):
     )
  
     try:
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
- 
+        async for line in _read_output_lines(proc.stdout):
             decoded_line = line.decode(errors="ignore").rstrip()
-            if not decoded_line.startswith(MARKER_DOWNLOAD):  # progress spam would flood the tail
+
+            if not decoded_line.startswith(MARKER_DOWNLOAD):
                 tail.append(decoded_line)
- 
+
             if verbose:
                 print(decoded_line)
                 continue
- 
+
             if show_progress:
                 if decoded_line.startswith(MARKER_DOWNLOAD):
-                    if show_progress:
-                        print("\r\033[K" + decoded_line, end="", flush=True)
+                    padded_line = decoded_line.ljust(progress_width)
+                    sys.stdout.write("\r" + padded_line)
+                    sys.stdout.flush()
+                    progress_width = max(progress_width, len(decoded_line))
 
                 elif decoded_line.startswith("[Merger]"):
-                    print(f"\n[YT-DLP] Merging: {decoded_line}")
+                    print_status(f"[YT-DLP] Merging: {decoded_line}")
 
                 elif decoded_line.startswith("[Metadata]"):
-                    print(f"\n[YT-DLP] Metadata: {decoded_line}")
+                    print_status(f"[YT-DLP] Metadata: {decoded_line}")
 
                 elif decoded_line.startswith("[EmbedThumbnail]"):
-                    print(f"\n[YT-DLP] Thumbnail: {decoded_line}")
+                    print_status(f"[YT-DLP] Thumbnail: {decoded_line}")
 
                 elif decoded_line.startswith("[EmbedSubtitle]"):
-                    print(f"\n[YT-DLP] Subtitles: {decoded_line}")
+                    print_status(f"[YT-DLP] Subtitles: {decoded_line}")
 
                 elif decoded_line.startswith("[Fixup"):
-                    print(f"\n[YT-DLP] Fixup: {decoded_line}")
+                    print_status(f"[YT-DLP] Fixup: {decoded_line}")
 
                 elif decoded_line:
-                    print(decoded_line)
+                    print_status(decoded_line)
+
             elif decoded_line.startswith(("ERROR", "WARNING")):
-                print(decoded_line)  # quiet mode must still surface problems
- 
-        print()  # Ensure the last progress line ends with a newline
+                print(decoded_line)
+
+        if progress_width:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            progress_width = 0
         rc = await proc.wait()
     except asyncio.CancelledError:
         await _stop_process(proc)
@@ -1745,6 +1790,9 @@ async def _download_async(url, database, title, config=None, auth_args=None):
             if rc == 0:
                 with open(paths_file, encoding="utf-8") as fh:
                     downloaded_files = [ln.strip() for ln in fh if ln.strip()]
+        except Exception as e:
+            print(f"[ERROR] An error occurred while running yt-dlp: {e}")
+            rc, tail = 1, str(e)
         finally:
             Path(paths_file).unlink(missing_ok=True)
  

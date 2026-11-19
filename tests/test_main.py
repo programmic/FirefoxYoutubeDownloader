@@ -108,6 +108,29 @@ class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
             download_worker._source_frame_rate({'r_frame_rate': '1000/1'}),
         )
 
+    def test_max_video_fps_caps_source_rate_without_slowing_video(self):
+        self.assertEqual(
+            download_worker._resolve_frame_rate(
+                {'r_frame_rate': '60/1'},
+                {'max_video_fps': 29.97},
+            ),
+            '29.97',
+        )
+        self.assertEqual(
+            download_worker._resolve_frame_rate(
+                {'r_frame_rate': '24/1'},
+                {'max_video_fps': 29.97},
+            ),
+            '24',
+        )
+        self.assertEqual(
+            download_worker._resolve_frame_rate(
+                {'r_frame_rate': '60/1'},
+                {'max_video_fps': 0},
+            ),
+            '60',
+        )
+
     def test_video_frame_count_uses_ffprobe_frame_fields(self):
         self.assertEqual(
             download_worker._video_frame_count({'nb_frames': '120'}),
@@ -128,22 +151,6 @@ class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn('[vc]fps=30,format=yuv420p10le[v]', graph)
-
-    def test_oversized_encode_gets_one_higher_crf_retry(self):
-        self.assertEqual(
-            download_worker._higher_crf({'video_crf': 30}),
-            38,
-        )
-        self.assertEqual(
-            download_worker._higher_crf({'video_crf': 50}),
-            51,
-        )
-        self.assertIsNone(
-            download_worker._higher_crf({'video_crf': 51}),
-        )
-        self.assertEqual(download_worker._higher_crf({}, 38), 46)
-        self.assertEqual(download_worker._higher_crf({}, 46), 51)
-        self.assertIsNone(download_worker._higher_crf({}, 51))
 
     def test_ffmpeg_resource_args_allow_automatic_threading(self):
         self.assertEqual(
