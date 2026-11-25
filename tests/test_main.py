@@ -1,4 +1,5 @@
 import asyncio
+from io import StringIO
 import os
 import pathlib
 import sys
@@ -53,10 +54,56 @@ class TestAppNano(unittest.TestCase):
                     [
                         '--js-runtimes', f'node:{runtime}',
                         '--remote-components', 'ejs:github',
+                        '--extractor-args',
+                        'youtube:player_client=default,-web_embedded',
                     ],
                 )
 
 class TestDownloadWorkerAsync(unittest.IsolatedAsyncioTestCase):
+    def test_format_percentage_supports_padding(self):
+        self.assertEqual(download_worker._format_percentage(0.823, width=6), '82%   ')
+        self.assertEqual(download_worker._format_percentage(1.0), '100%')
+
+    async def test_ytdlp_progress_updates_one_terminal_line(self):
+        class OutputStream:
+            def __init__(self):
+                self.lines = iter((b'[download] 1%\r', b'[download] 2%\r', b''))
+
+            async def read(self, _size):
+                return next(self.lines)
+
+        process = MagicMock(
+            stdout=OutputStream(),
+            returncode=0,
+            wait=AsyncMock(),
+        )
+        output = StringIO()
+        with patch(
+            'server.download_worker.asyncio.create_subprocess_exec',
+            new=AsyncMock(return_value=process),
+        ), patch('server.download_worker.sys.stdout', output):
+            await download_worker._run_ytdlp(['yt-dlp'], {'progress': True})
+
+        self.assertEqual(output.getvalue().count('\n'), 1)
+
+    async def test_video_resolution_uses_ffprobe(self):
+        process = MagicMock(returncode=0)
+        process.communicate = AsyncMock(
+            return_value=(b'{"streams": [{"width": 1920, "height": 1080}]}', b'')
+        )
+
+        with patch(
+            'server.download_worker.asyncio.create_subprocess_exec',
+            new=AsyncMock(return_value=process),
+        ) as create_process:
+            resolution = await download_worker._get_video_resolution(
+                pathlib.Path('video.mkv'),
+                pathlib.Path('ffprobe.exe'),
+            )
+
+        self.assertEqual(resolution, '1920x1080')
+        self.assertEqual(create_process.call_args.args[0], 'ffprobe.exe')
+
     def test_format_selector_prefers_original_audio_track(self):
         selector = download_worker._build_format_selector({
             'max_resolution': 1080,

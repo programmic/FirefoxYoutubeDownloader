@@ -1,7 +1,7 @@
 {
     "manifest_version": 2,
     "name": "YT Smart Downloader",
-    "version": "1.1.4",
+    "version": "1.1.6",
     "description": "Queues YouTube tabs to local downloader",
     "browser_specific_settings": {
         "gecko": {
@@ -15,6 +15,7 @@
     },
     "permissions": [
         "tabs",
+        "*://*.youtube.com/*",
         "http://127.0.0.1/*"
     ],
     "background": {
@@ -24,16 +25,24 @@
     },
     "browser_action": {
         "default_title": "YT Smart Downloader",
-        "default_popup": "popup.html"
+        "default_popup": "popup.html",
+        "default_icon": {
+            "32": "icons/icon_32.png"
+        }
     },
     "icons": {
         "32": "icons/icon_32.png",
         "64": "icons/icon_64.png"
     },
-    "action": {
-        "default_icon": {
-            "32": "icons/icon-32.png"
-        },
-        "default_popup": "popup.html"
-    }
+    "content_scripts": [
+        {
+            "matches": [
+                "*://*.youtube.com/*"
+            ],
+            "js": [
+                "yt_menu.js"
+            ],
+            "run_at": "document_idle"
+        }
+    ]
 }

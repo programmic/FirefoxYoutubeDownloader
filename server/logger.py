@@ -27,7 +27,7 @@ class Logger:
             f"Timestamp: {self.current_doc[Log.TIMESTAMP] if Log.TIMESTAMP in self.current_doc else 'Timestamp not available'}",
             f"Download Duration: {self.current_doc[Log.DOWNLOAD_DURATION] if Log.DOWNLOAD_DURATION in self.current_doc else 'Download duration not available'}",
             f"Encoding Duration: {self.current_doc[Log.ENCODING_DURATION] if Log.ENCODING_DURATION in self.current_doc else 'Encoding duration not available'}",
-            f"{self.current_doc[Log.ORIGINAL_SIZE]} >>> {self.current_doc[Log.FINAL_SIZE]} ({self.current_doc[Log.PERCENTAGE_REDUCTION]}% reduction)" if all_size_variables else "No size information available",
+            f"{self.current_doc[Log.ORIGINAL_SIZE]} >>> {self.current_doc[Log.FINAL_SIZE]} ({100 - float(self.current_doc[Log.PERCENTAGE_REDUCTION])}% of original)" if all_size_variables else "No size information available",
             f"{'='*30}",
             f"selected: {self.current_doc[Log.SBCUT] if Log.SBCUT in self.current_doc else 'SBCUT not available'}",
             "\n"

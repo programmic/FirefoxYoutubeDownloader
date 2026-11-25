@@ -80,6 +80,29 @@ async function downloadAll() {
 }
 
 
+async function downloadUrl(url) {
+    if (!isYoutubeVideoUrl(url)) {
+        return {
+            message: "Invalid YouTube video URL"
+        };
+    }
+
+    const res = await send("enqueue", { url });
+
+    if (!res.ok) {
+        return {
+            message: "Failed to enqueue: " +
+                (res.error || res.status)
+        };
+    }
+
+    return {
+        message: "Video queued successfully"
+    };
+}
+
+
+
 
 async function enqueueTab(tab) {
     try {
@@ -157,6 +180,8 @@ browser.runtime.onMessage.addListener((message, sender) => {
             return downloadCurrent();
         case 'downloadSpecific':
             return downloadSpecific();
+        case 'downloadUrl':
+            return downloadUrl(message.url);
         default:
             return Promise.resolve({ error: 'unknown_action' });
     }

@@ -1,5 +1,6 @@
 import time
 import asyncio
+import traceback
 
 from .download_worker import download_video
 from .database import Database
@@ -47,12 +48,22 @@ async def worker(queue: asyncio.Queue):
                 print(f"[WORKER] Timeout downloading: {url}")
                 db.update_status(url, "failed")
             except Exception as e:
-                print(f"\033[31m[WORKER] Error downloading {url}:\033[91m", e, "\033[0m")
+                print(f"\033[31m[WORKER] Error downloading {url}:\033[91m {e}\033[0m")
+                traceback.print_exc()
                 try:
                     db.update_status(url, "failed")
                 except Exception:
                     # ensure worker loop doesn't crash when DB update fails
                     print(f"\033[31m[WORKER] Failed to write error status to DB\033[0m")
+            except BaseException as e:
+                # BaseException includes shutdown cancellations. Record and requeue
+                # interrupted work, but do not hide the cancellation from the task.
+                print(f"[WORKER] Download interrupted: {url}: {type(e).__name__}: {e}")
+                try:
+                    db.update_status(url, "queued")
+                except Exception:
+                    traceback.print_exc()
+                raise
             finally:
                 state.active_downloads -= 1
                 queue.task_done()

@@ -7,7 +7,7 @@ show_config_on_startup = true
 download_timeout = 0 # Seconds per video; 0 = no limit (H1).
 max_concurrent_downloads = 1
 mark_watched = false # Not yet implemented.
-progress = true
+progress = true # Show yt-dlp progress on one continuously updated terminal line.
 ytdlp_verbal = false # Enable verbose yt-dlp output for debugging.
 
 # Authentication and cookies.

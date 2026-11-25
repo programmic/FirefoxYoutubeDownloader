@@ -280,10 +280,12 @@ async def log(msg: dict):
 async def command(request: Request):
     try:
         data = await request.json()
-    except Exception:
+    except Exception as e:
+        print(f"[COMMAND] Failed to parse JSON: {e}")
         return JSONResponse(status_code=422, content={"detail": "Invalid JSON"})
     cmd = data.get("cmd")
     if not isinstance(cmd, str):
+        print(f"[COMMAND] Missing 'cmd' string. Received: {data} ({type(data)})")
         return JSONResponse(status_code=422, content={"detail": "Missing 'cmd' string"})
 
     if cmd == "!RUNALL":
@@ -321,7 +323,7 @@ async def command(request: Request):
             return {"status": "selection_ready", "signal": signal, "select_url": select_url}
         else:
             return JSONResponse(status_code=404, content={"detail": "Signal not found"})
-
+    print(f"[COMMAND] Unknown command: {cmd}")
     return {"status": "unknown_command"}
 
 
